@@ -50,7 +50,7 @@ func TestServerTwoClientOnlineFlowAndUDPRelay(t *testing.T) {
 	cfg.RelayAddr = "127.0.0.1:0"
 	cfg.HealthAddr = "127.0.0.1:0"
 	cfg.PublicHost = "127.0.0.1"
-	cfg.DataFile = filepath.Join(t.TempDir(), "profiles.json")
+	cfg.DataFile = filepath.Join(t.TempDir(), "profiles.db")
 	cfg.AllowInsecurePasswordAuth = true
 	cfg.ControlReadTimeout = 10 * time.Second
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -410,7 +410,7 @@ func TestServerShutdownClosesUnauthenticatedIdleClient(t *testing.T) {
 	cfg.RelayAddr = "127.0.0.1:0"
 	cfg.HealthAddr = "127.0.0.1:0"
 	cfg.PublicHost = "127.0.0.1"
-	cfg.DataFile = filepath.Join(t.TempDir(), "profiles.json")
+	cfg.DataFile = filepath.Join(t.TempDir(), "profiles.db")
 	server, err := NewServer(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
@@ -452,7 +452,7 @@ func TestServerTLSAuthenticatesPersistentProfiles(t *testing.T) {
 	cfg.RelayAddr = "127.0.0.1:0"
 	cfg.HealthAddr = "127.0.0.1:0"
 	cfg.PublicHost = "127.0.0.1"
-	cfg.DataFile = filepath.Join(t.TempDir(), "profiles.json")
+	cfg.DataFile = filepath.Join(t.TempDir(), "profiles.db")
 	cfg.TLSCertFile = certFile
 	cfg.TLSKeyFile = keyFile
 	server, err := NewServer(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -524,7 +524,7 @@ func TestServerGuestIdentityAndCapacityLimits(t *testing.T) {
 	cfg.RelayAddr = "127.0.0.1:0"
 	cfg.HealthAddr = "127.0.0.1:0"
 	cfg.PublicHost = "127.0.0.1"
-	cfg.DataFile = filepath.Join(t.TempDir(), "profiles.json")
+	cfg.DataFile = filepath.Join(t.TempDir(), "profiles.db")
 	cfg.MaxOnlinePlayers = 2
 	cfg.MaxStagedGames = 1
 	cfg.MaxChatMessagesPer10Secs = 1
@@ -604,7 +604,7 @@ func TestServerPersistentSocialStatsAndQuickmatchFlow(t *testing.T) {
 	cfg.RelayAddr = "127.0.0.1:0"
 	cfg.HealthAddr = "127.0.0.1:0"
 	cfg.PublicHost = "127.0.0.1"
-	cfg.DataFile = filepath.Join(t.TempDir(), "profiles.json")
+	cfg.DataFile = filepath.Join(t.TempDir(), "profiles.db")
 	cfg.AllowInsecurePasswordAuth = true
 	server, err := NewServer(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
@@ -1292,7 +1292,7 @@ func hardeningTestConfig(t *testing.T) Config {
 	cfg.RelayAddr = "127.0.0.1:0"
 	cfg.HealthAddr = "127.0.0.1:0"
 	cfg.PublicHost = "127.0.0.1"
-	cfg.DataFile = filepath.Join(t.TempDir(), "profiles.json")
+	cfg.DataFile = filepath.Join(t.TempDir(), "profiles.db")
 	cfg.AllowInsecurePasswordAuth = true
 	return cfg
 }

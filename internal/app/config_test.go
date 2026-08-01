@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -11,8 +12,13 @@ func TestNewServerValidatesPublicHost(t *testing.T) {
 		cfg := DefaultConfig()
 		cfg.PublicHost = host
 		cfg.DataFile = ""
-		if _, err := NewServer(cfg, nil); err != nil {
+		server, err := NewServer(cfg, nil)
+		if err != nil {
 			t.Errorf("valid public host %q was rejected: %v", host, err)
+			continue
+		}
+		if err := server.Shutdown(context.Background()); err != nil {
+			t.Errorf("close server for public host %q: %v", host, err)
 		}
 	}
 
@@ -37,8 +43,12 @@ func TestNewServerValidatesStartReadyTimeout(t *testing.T) {
 	valid := DefaultConfig()
 	valid.DataFile = ""
 	valid.StartReadyTimeout = 5 * time.Minute
-	if _, err := NewServer(valid, nil); err != nil {
+	server, err := NewServer(valid, nil)
+	if err != nil {
 		t.Fatalf("maximum start-ready timeout was rejected: %v", err)
+	}
+	if err := server.Shutdown(context.Background()); err != nil {
+		t.Fatalf("close server: %v", err)
 	}
 
 	for _, timeout := range []time.Duration{0, -time.Second, 5*time.Minute + time.Nanosecond} {

@@ -223,8 +223,8 @@ Only one live connection per `user_id` is retained. Replacing a connection
 sends `session.replaced` to the older connection before closing it.
 
 Password auth is rejected on plaintext TCP by default. Local development may
-start the server with `-allow-insecure-password-auth`; Internet deployments
-should configure `-tls-cert` and `-tls-key`. Persistent token resumption is
+start the server with `--allow-insecure-password-auth`; Internet deployments
+should configure `--tls-cert` and `--tls-key`. Persistent token resumption is
 also rejected on plaintext unless that unsafe development override is set.
 The standalone game uses only `auth.guest` for a bare endpoint and never
 serializes its password there. Plaintext exposes chat and control metadata.
@@ -347,7 +347,7 @@ created only after GAMESTART. The final confirmation changes state to
 {"v":1,"type":"game.go","data":{"game_id":"0123456789abcdef"}}
 ```
 
-If every member does not confirm within `-start-ready-timeout` (15 seconds by
+If every member does not confirm within `--start-ready-timeout` (15 seconds by
 default), the relay and game are deleted and members receive `game.ended` with
 reason `start_timeout`. Any departure while `starting` similarly cancels with
 reason `player_left`. Timer generation and state checks prevent a stale timeout

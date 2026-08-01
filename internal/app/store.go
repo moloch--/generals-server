@@ -5,55 +5,53 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/base64"
+	"database/sql"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"modernc.org/sqlite"
 )
 
 const (
-	passwordIterations   = 120_000
-	passwordKeyBytes     = 32
-	maxBuddies           = 100
-	defaultMaxProfiles   = 10_000
-	maxSupportedProfiles = 100_000
+	passwordIterations           = 120_000
+	passwordKeyBytes             = 32
+	maxBuddies                   = 100
+	defaultMaxProfiles           = 10_000
+	maxSupportedProfiles         = 100_000
+	profileDatabaseSchemaVersion = 1
+	profileDatabaseApplicationID = 0x47585052 // "GXPR"
+	sqliteBusyTimeoutMillis      = 5_000
 )
 
 var usernamePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]{3,24}$`)
 var displayNamePattern = regexp.MustCompile(`^[A-Za-z0-9._ -]{1,24}$`)
 var ErrProfileLimit = errors.New("persistent profile limit reached")
-
-type storedProfile struct {
-	Profile
-	PasswordSalt string      `json:"password_salt"`
-	PasswordHash string      `json:"password_hash"`
-	Stats        PlayerStats `json:"stats"`
-	Buddies      []uint64    `json:"buddies,omitempty"`
-	Pending      []uint64    `json:"pending_buddy_requests,omitempty"`
-}
-
-type profileDatabase struct {
-	Version  int             `json:"version"`
-	NextID   uint64          `json:"next_id"`
-	Profiles []storedProfile `json:"profiles"`
-}
+var memoryDatabaseID atomic.Uint64
 
 type ProfileStore struct {
-	mu          sync.RWMutex
-	path        string
+	db          *sql.DB
 	maxProfiles int
-	nextID      uint64
-	byID        map[uint64]storedProfile
-	byName      map[string]uint64
-	byDisplay   map[string]uint64
+	closeOnce   sync.Once
+	closeErr    error
+}
+
+type sqlRowScanner interface {
+	Scan(dest ...any) error
+}
+
+type sqlRowQuerier interface {
+	QueryRow(query string, args ...any) *sql.Row
 }
 
 func OpenProfileStore(path string) (*ProfileStore, error) {
@@ -64,65 +62,225 @@ func OpenProfileStoreWithLimit(path string, maxProfiles int) (*ProfileStore, err
 	if maxProfiles < 1 || maxProfiles > maxSupportedProfiles {
 		return nil, fmt.Errorf("profile limit must be between 1 and %d", maxSupportedProfiles)
 	}
-	s := &ProfileStore{
-		path:        path,
-		maxProfiles: maxProfiles,
-		nextID:      1,
-		byID:        make(map[uint64]storedProfile),
-		byName:      make(map[string]uint64),
-		byDisplay:   make(map[string]uint64),
-	}
-	if path == "" {
-		return s, nil
-	}
 
-	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return s, nil
-	}
+	dsn, databasePath, err := profileDatabaseDSN(path)
 	if err != nil {
-		return nil, fmt.Errorf("read profile database: %w", err)
+		return nil, err
+	}
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open profile database: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	cleanup := func(openErr error) (*ProfileStore, error) {
+		closeErr := db.Close()
+		return nil, errors.Join(openErr, closeErr)
+	}
+	if err := db.Ping(); err != nil {
+		return cleanup(fmt.Errorf("connect to profile database: %w", err))
+	}
+	if err := initializeProfileSchema(db); err != nil {
+		return cleanup(err)
+	}
+	if err := configureProfileDatabase(db, databasePath); err != nil {
+		return cleanup(err)
 	}
 
-	var db profileDatabase
-	if err := json.Unmarshal(data, &db); err != nil {
-		return nil, fmt.Errorf("decode profile database: %w", err)
+	var profileCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM profiles`).Scan(&profileCount); err != nil {
+		return cleanup(fmt.Errorf("count profiles: %w", err))
 	}
-	if db.Version != 1 {
-		return nil, fmt.Errorf("unsupported profile database version %d", db.Version)
+	if profileCount > maxProfiles {
+		return cleanup(fmt.Errorf("profile database contains %d profiles, exceeding configured limit %d", profileCount, maxProfiles))
 	}
-	if len(db.Profiles) > s.maxProfiles {
-		return nil, fmt.Errorf("profile database contains %d profiles, exceeding configured limit %d", len(db.Profiles), s.maxProfiles)
-	}
-	if db.NextID > 0 {
-		s.nextID = db.NextID
-	}
-	for _, p := range db.Profiles {
-		name := normalizeUsername(p.Username)
-		if p.UserID == 0 || !usernamePattern.MatchString(p.Username) {
-			return nil, errors.New("profile database contains an invalid profile")
-		}
-		if _, exists := s.byID[p.UserID]; exists {
-			return nil, fmt.Errorf("duplicate profile id %d", p.UserID)
-		}
-		if _, exists := s.byName[name]; exists {
-			return nil, fmt.Errorf("duplicate username %q", p.Username)
-		}
-		if err := validateDisplayName(p.DisplayName); err != nil {
-			return nil, fmt.Errorf("profile %d has an invalid display name", p.UserID)
-		}
-		display := normalizeDisplayName(p.DisplayName)
-		if _, exists := s.byDisplay[display]; exists {
-			return nil, fmt.Errorf("duplicate display name %q", p.DisplayName)
-		}
-		s.byID[p.UserID] = p
-		s.byName[name] = p.UserID
-		s.byDisplay[display] = p.UserID
-		if p.UserID >= s.nextID {
-			s.nextID = p.UserID + 1
+	if databasePath != "" {
+		if err := secureSQLiteFiles(databasePath); err != nil {
+			return cleanup(fmt.Errorf("secure profile database: %w", err))
 		}
 	}
-	return s, nil
+
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(4)
+	return &ProfileStore{db: db, maxProfiles: maxProfiles}, nil
+}
+
+func profileDatabaseDSN(path string) (dsn, databasePath string, err error) {
+	query := url.Values{}
+	query.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", sqliteBusyTimeoutMillis))
+	query.Add("_pragma", "foreign_keys(1)")
+	query.Set("_txlock", "immediate")
+
+	if path == "" {
+		query.Set("mode", "memory")
+		query.Set("cache", "shared")
+		name := fmt.Sprintf("generals-server-%d", memoryDatabaseID.Add(1))
+		return "file:" + name + "?" + query.Encode(), "", nil
+	}
+
+	absolutePath, err := filepath.Abs(path)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve profile database path: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(absolutePath), 0o700); err != nil {
+		return "", "", fmt.Errorf("create profile database directory: %w", err)
+	}
+	databaseFile, err := os.OpenFile(absolutePath, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return "", "", fmt.Errorf("create profile database: %w", err)
+	}
+	if err := databaseFile.Close(); err != nil {
+		return "", "", fmt.Errorf("close profile database: %w", err)
+	}
+	if err := secureSQLiteFiles(absolutePath); err != nil {
+		return "", "", fmt.Errorf("secure profile database: %w", err)
+	}
+
+	query.Add("_pragma", "synchronous(FULL)")
+	databaseURL := url.URL{
+		Scheme:   "file",
+		Path:     filepath.ToSlash(absolutePath),
+		RawQuery: query.Encode(),
+	}
+	return databaseURL.String(), absolutePath, nil
+}
+
+func configureProfileDatabase(db *sql.DB, databasePath string) error {
+	if databasePath == "" {
+		return nil
+	}
+	deadline := time.Now().Add(time.Duration(sqliteBusyTimeoutMillis) * time.Millisecond)
+	for {
+		var journalMode string
+		err := db.QueryRow(`PRAGMA journal_mode = WAL`).Scan(&journalMode)
+		if err == nil {
+			if !strings.EqualFold(journalMode, "wal") {
+				return fmt.Errorf("enable profile database WAL: SQLite selected %q mode", journalMode)
+			}
+			return nil
+		}
+		if !isSQLiteBusy(err) || time.Now().After(deadline) {
+			return fmt.Errorf("enable profile database WAL: %w", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func isSQLiteBusy(err error) bool {
+	var sqliteErr *sqlite.Error
+	return errors.As(err, &sqliteErr) && sqliteErr.Code()&0xff == 5
+}
+
+func secureSQLiteFiles(path string) error {
+	for _, candidate := range []string{path, path + "-wal", path + "-shm"} {
+		if err := os.Chmod(candidate, 0o600); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+func initializeProfileSchema(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin profile database migration: %w", err)
+	}
+	defer tx.Rollback()
+
+	var applicationID int
+	if err := tx.QueryRow(`PRAGMA application_id`).Scan(&applicationID); err != nil {
+		return fmt.Errorf("read profile database application id: %w", err)
+	}
+	if applicationID != 0 && applicationID != profileDatabaseApplicationID {
+		return fmt.Errorf("profile database has unexpected application id %d", applicationID)
+	}
+
+	var version int
+	if err := tx.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		return fmt.Errorf("read profile database schema version: %w", err)
+	}
+	if version > profileDatabaseSchemaVersion {
+		return fmt.Errorf("profile database schema version %d is newer than supported version %d", version, profileDatabaseSchemaVersion)
+	}
+	if version == profileDatabaseSchemaVersion {
+		if applicationID != profileDatabaseApplicationID {
+			return errors.New("profile database schema is missing the GeneralsX application id")
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("finish profile database validation: %w", err)
+		}
+		return nil
+	}
+
+	if version < 1 {
+		var existingObjects int
+		if err := tx.QueryRow(`
+			SELECT COUNT(*) FROM sqlite_master
+			WHERE name NOT LIKE 'sqlite_%' AND type IN ('table', 'index', 'view', 'trigger')`).Scan(&existingObjects); err != nil {
+			return fmt.Errorf("inspect unversioned profile database: %w", err)
+		}
+		if existingObjects != 0 {
+			return errors.New("refusing to initialize a non-empty unversioned SQLite database")
+		}
+		for _, statement := range profileSchemaVersion1 {
+			if _, err := tx.Exec(statement); err != nil {
+				return fmt.Errorf("create profile database schema: %w", err)
+			}
+		}
+		if _, err := tx.Exec(fmt.Sprintf(`PRAGMA application_id = %d`, profileDatabaseApplicationID)); err != nil {
+			return fmt.Errorf("set profile database application id: %w", err)
+		}
+		if _, err := tx.Exec(`PRAGMA user_version = 1`); err != nil {
+			return fmt.Errorf("set profile database schema version: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit profile database migration: %w", err)
+	}
+	return nil
+}
+
+var profileSchemaVersion1 = []string{
+	`CREATE TABLE profiles (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		username TEXT NOT NULL,
+		username_key TEXT NOT NULL UNIQUE,
+		display_name TEXT NOT NULL,
+		display_name_key TEXT NOT NULL UNIQUE,
+		created_at TEXT NOT NULL,
+		password_salt BLOB NOT NULL,
+		password_hash BLOB NOT NULL,
+		password_iterations INTEGER NOT NULL CHECK (password_iterations > 0),
+		wins INTEGER NOT NULL DEFAULT 0 CHECK (wins >= 0),
+		losses INTEGER NOT NULL DEFAULT 0 CHECK (losses >= 0),
+		disconnects INTEGER NOT NULL DEFAULT 0 CHECK (disconnects >= 0),
+		games INTEGER NOT NULL DEFAULT 0 CHECK (games >= 0),
+		rating INTEGER NOT NULL DEFAULT 0 CHECK (rating >= 0)
+	) STRICT`,
+	`CREATE TABLE buddies (
+		user_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+		buddy_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+		PRIMARY KEY (user_id, buddy_id),
+		CHECK (user_id < buddy_id)
+	) WITHOUT ROWID, STRICT`,
+	`CREATE INDEX buddies_by_buddy_id ON buddies(buddy_id)`,
+	`CREATE TABLE buddy_requests (
+		requester_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+		recipient_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+		PRIMARY KEY (requester_id, recipient_id),
+		CHECK (requester_id != recipient_id)
+	) WITHOUT ROWID, STRICT`,
+	`CREATE INDEX buddy_requests_by_recipient_id ON buddy_requests(recipient_id)`,
+}
+
+func (s *ProfileStore) Close() error {
+	s.closeOnce.Do(func() {
+		if s.db != nil {
+			s.closeErr = s.db.Close()
+		}
+	})
+	return s.closeErr
 }
 
 func (s *ProfileStore) Register(username, password, displayName string) (Profile, error) {
@@ -137,110 +295,165 @@ func (s *ProfileStore) Register(username, password, displayName string) (Profile
 	if err := validateDisplayName(displayName); err != nil {
 		return Profile{}, err
 	}
-	key := normalizeUsername(username)
-	displayKey := normalizeDisplayName(displayName)
-	s.mu.RLock()
-	if len(s.byID) >= s.maxProfiles {
-		s.mu.RUnlock()
-		return Profile{}, ErrProfileLimit
-	}
-	if _, exists := s.byName[key]; exists {
-		s.mu.RUnlock()
-		return Profile{}, errors.New("username already exists")
-	}
-	if _, exists := s.byDisplay[displayKey]; exists {
-		s.mu.RUnlock()
-		return Profile{}, errors.New("display name already exists")
-	}
-	s.mu.RUnlock()
 
 	salt := make([]byte, 16)
 	if _, err := rand.Read(salt); err != nil {
 		return Profile{}, fmt.Errorf("generate password salt: %w", err)
 	}
 	hash := derivePassword([]byte(password), salt, passwordIterations, passwordKeyBytes)
+	profile := Profile{
+		Username:    username,
+		DisplayName: displayName,
+		CreatedAt:   time.Now().UTC(),
+	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.byID) >= s.maxProfiles {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return Profile{}, fmt.Errorf("begin profile registration: %w", err)
+	}
+	defer tx.Rollback()
+
+	var count int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM profiles`).Scan(&count); err != nil {
+		return Profile{}, fmt.Errorf("count profiles: %w", err)
+	}
+	if count >= s.maxProfiles {
 		return Profile{}, ErrProfileLimit
 	}
-	if _, exists := s.byName[key]; exists {
+	if exists, err := profileValueExists(tx, "username_key", normalizeUsername(username)); err != nil {
+		return Profile{}, err
+	} else if exists {
 		return Profile{}, errors.New("username already exists")
 	}
-	if _, exists := s.byDisplay[displayKey]; exists {
+	if exists, err := profileValueExists(tx, "display_name_key", normalizeDisplayName(displayName)); err != nil {
+		return Profile{}, err
+	} else if exists {
 		return Profile{}, errors.New("display name already exists")
 	}
-	p := storedProfile{
-		Profile: Profile{
-			UserID:      s.nextID,
-			Username:    username,
-			DisplayName: displayName,
-			CreatedAt:   time.Now().UTC(),
-		},
-		PasswordSalt: base64.RawStdEncoding.EncodeToString(salt),
-		PasswordHash: base64.RawStdEncoding.EncodeToString(hash),
+
+	result, err := tx.Exec(`
+		INSERT INTO profiles (
+			username, username_key, display_name, display_name_key, created_at,
+			password_salt, password_hash, password_iterations
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		username, normalizeUsername(username), displayName, normalizeDisplayName(displayName),
+		profile.CreatedAt.Format(time.RFC3339Nano), salt, hash, passwordIterations)
+	if err != nil {
+		return Profile{}, fmt.Errorf("insert profile: %w", err)
 	}
-	s.nextID++
-	s.byID[p.UserID] = p
-	s.byName[key] = p.UserID
-	s.byDisplay[displayKey] = p.UserID
-	if err := s.saveLocked(); err != nil {
-		delete(s.byID, p.UserID)
-		delete(s.byName, key)
-		delete(s.byDisplay, displayKey)
-		s.nextID--
-		return Profile{}, err
+	id, err := result.LastInsertId()
+	if err != nil {
+		return Profile{}, fmt.Errorf("read profile id: %w", err)
 	}
-	return p.Profile, nil
+	if id < 1 {
+		return Profile{}, errors.New("profile database generated an invalid id")
+	}
+	profile.UserID = uint64(id)
+	if err := tx.Commit(); err != nil {
+		return Profile{}, fmt.Errorf("commit profile registration: %w", err)
+	}
+	return profile, nil
+}
+
+func profileValueExists(tx *sql.Tx, column, value string) (bool, error) {
+	var exists bool
+	query := `SELECT EXISTS(SELECT 1 FROM profiles WHERE ` + column + ` = ?)`
+	if err := tx.QueryRow(query, value).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check profile uniqueness: %w", err)
+	}
+	return exists, nil
 }
 
 func (s *ProfileStore) Authenticate(username, password string) (Profile, error) {
-	s.mu.RLock()
-	id, ok := s.byName[normalizeUsername(username)]
-	p := s.byID[id]
-	s.mu.RUnlock()
-	if !ok {
-		// Do comparable work for unknown accounts to reduce username timing leaks.
-		dummySalt := make([]byte, 16)
-		_ = derivePassword([]byte(password), dummySalt, passwordIterations, passwordKeyBytes)
-		return Profile{}, errors.New("invalid username or password")
+	row := s.db.QueryRow(`
+		SELECT id, username, display_name, created_at, password_salt, password_hash, password_iterations
+		FROM profiles WHERE username_key = ?`, normalizeUsername(username))
+	var profile Profile
+	var id int64
+	var createdAt string
+	var salt, want []byte
+	var iterations int
+	if err := row.Scan(&id, &profile.Username, &profile.DisplayName, &createdAt, &salt, &want, &iterations); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			dummySalt := make([]byte, 16)
+			_ = derivePassword([]byte(password), dummySalt, passwordIterations, passwordKeyBytes)
+			return Profile{}, errors.New("invalid username or password")
+		}
+		return Profile{}, fmt.Errorf("read credentials: %w", err)
 	}
-	salt, err := base64.RawStdEncoding.DecodeString(p.PasswordSalt)
-	if err != nil {
+	if id < 1 || len(salt) != 16 || len(want) < 1 || iterations < 1 || iterations > 10_000_000 {
 		return Profile{}, errors.New("stored credentials are corrupt")
 	}
-	want, err := base64.RawStdEncoding.DecodeString(p.PasswordHash)
+	created, err := time.Parse(time.RFC3339Nano, createdAt)
 	if err != nil {
-		return Profile{}, errors.New("stored credentials are corrupt")
+		return Profile{}, errors.New("stored profile is corrupt")
 	}
-	got := derivePassword([]byte(password), salt, passwordIterations, len(want))
+	profile.UserID = uint64(id)
+	profile.CreatedAt = created
+	got := derivePassword([]byte(password), salt, iterations, len(want))
 	if subtle.ConstantTimeCompare(got, want) != 1 {
 		return Profile{}, errors.New("invalid username or password")
 	}
-	return p.Profile, nil
+	return profile, nil
 }
 
 func (s *ProfileStore) Get(id uint64) (Profile, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	p, ok := s.byID[id]
-	return p.Profile, ok
+	databaseID, ok := sqliteID(id)
+	if !ok {
+		return Profile{}, false
+	}
+	profile, err := queryProfile(s.db, `WHERE id = ?`, databaseID)
+	return profile, err == nil
 }
 
 func (s *ProfileStore) Find(displayName string) (Profile, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	id, ok := s.byDisplay[normalizeDisplayName(displayName)]
-	p := s.byID[id]
-	return p.Profile, ok
+	profile, err := queryProfile(s.db, `WHERE display_name_key = ?`, normalizeDisplayName(displayName))
+	return profile, err == nil
+}
+
+func queryProfile(queryer sqlRowQuerier, predicate string, args ...any) (Profile, error) {
+	row := queryer.QueryRow(`
+		SELECT id, username, display_name, created_at
+		FROM profiles `+predicate, args...)
+	return scanProfile(row)
+}
+
+func scanProfile(row sqlRowScanner) (Profile, error) {
+	var profile Profile
+	var id int64
+	var createdAt string
+	if err := row.Scan(&id, &profile.Username, &profile.DisplayName, &createdAt); err != nil {
+		return Profile{}, err
+	}
+	if id < 1 {
+		return Profile{}, errors.New("stored profile has invalid id")
+	}
+	created, err := time.Parse(time.RFC3339Nano, createdAt)
+	if err != nil {
+		return Profile{}, errors.New("stored profile has invalid creation time")
+	}
+	profile.UserID = uint64(id)
+	profile.CreatedAt = created
+	return profile, nil
 }
 
 func (s *ProfileStore) Stats(id uint64) (PlayerStats, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	p, ok := s.byID[id]
-	return p.Stats, ok
+	databaseID, ok := sqliteID(id)
+	if !ok {
+		return PlayerStats{}, false
+	}
+	stats, err := queryStats(s.db.QueryRow(`
+		SELECT wins, losses, disconnects, games, rating
+		FROM profiles WHERE id = ?`, databaseID))
+	return stats, err == nil
+}
+
+func queryStats(row sqlRowScanner) (PlayerStats, error) {
+	var stats PlayerStats
+	if err := row.Scan(&stats.Wins, &stats.Losses, &stats.Disconnects, &stats.Games, &stats.Rating); err != nil {
+		return PlayerStats{}, err
+	}
+	return stats, nil
 }
 
 func (s *ProfileStore) ApplyStats(id uint64, update PlayerStats) (PlayerStats, error) {
@@ -252,75 +465,195 @@ func (s *ProfileStore) ApplyStats(id uint64, update PlayerStats) (PlayerStats, e
 }
 
 func (s *ProfileStore) ApplyStatsBatch(updates map[uint64]PlayerStats) (map[uint64]PlayerStats, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	old := make(map[uint64]storedProfile, len(updates))
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin stats update: %w", err)
+	}
+	defer tx.Rollback()
+
+	ids := make([]uint64, 0, len(updates))
 	for id := range updates {
-		p, ok := s.byID[id]
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	result := make(map[uint64]PlayerStats, len(updates))
+	for _, id := range ids {
+		databaseID, ok := sqliteID(id)
 		if !ok {
 			return nil, fmt.Errorf("profile %d not found", id)
 		}
-		old[id] = p
-	}
-	result := make(map[uint64]PlayerStats, len(updates))
-	for id, update := range updates {
-		p := s.byID[id]
-		p.Stats.Wins += update.Wins
-		p.Stats.Losses += update.Losses
-		p.Stats.Disconnects += update.Disconnects
-		p.Stats.Games += update.Games
-		p.Stats.Rating += update.Rating
-		if p.Stats.Rating < 0 {
-			p.Stats.Rating = 0
+		current, err := queryStats(tx.QueryRow(`
+			SELECT wins, losses, disconnects, games, rating
+			FROM profiles WHERE id = ?`, databaseID))
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("profile %d not found", id)
 		}
-		s.byID[id] = p
-		result[id] = p.Stats
-	}
-	if err := s.saveLocked(); err != nil {
-		for id, profile := range old {
-			s.byID[id] = profile
+		if err != nil {
+			return nil, fmt.Errorf("read profile %d stats: %w", id, err)
 		}
-		return nil, err
+		next, err := addStats(current, updates[id])
+		if err != nil {
+			return nil, fmt.Errorf("update profile %d stats: %w", id, err)
+		}
+		if _, err := tx.Exec(`
+			UPDATE profiles
+			SET wins = ?, losses = ?, disconnects = ?, games = ?, rating = ?
+			WHERE id = ?`, next.Wins, next.Losses, next.Disconnects, next.Games, next.Rating, databaseID); err != nil {
+			return nil, fmt.Errorf("write profile %d stats: %w", id, err)
+		}
+		result[id] = next
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit stats update: %w", err)
 	}
 	return result, nil
 }
 
+func addStats(current, update PlayerStats) (PlayerStats, error) {
+	var err error
+	if current.Wins, err = addSQLiteCounter(current.Wins, update.Wins); err != nil {
+		return PlayerStats{}, fmt.Errorf("wins: %w", err)
+	}
+	if current.Losses, err = addSQLiteCounter(current.Losses, update.Losses); err != nil {
+		return PlayerStats{}, fmt.Errorf("losses: %w", err)
+	}
+	if current.Disconnects, err = addSQLiteCounter(current.Disconnects, update.Disconnects); err != nil {
+		return PlayerStats{}, fmt.Errorf("disconnects: %w", err)
+	}
+	if current.Games, err = addSQLiteCounter(current.Games, update.Games); err != nil {
+		return PlayerStats{}, fmt.Errorf("games: %w", err)
+	}
+	if update.Rating > 0 && current.Rating > math.MaxInt64-update.Rating {
+		return PlayerStats{}, errors.New("rating overflow")
+	}
+	if update.Rating < 0 && current.Rating < math.MinInt64-update.Rating {
+		current.Rating = 0
+	} else {
+		current.Rating += update.Rating
+		if current.Rating < 0 {
+			current.Rating = 0
+		}
+	}
+	return current, nil
+}
+
+func addSQLiteCounter(current, update uint64) (uint64, error) {
+	if current > math.MaxInt64 || update > math.MaxInt64 || current > uint64(math.MaxInt64)-update {
+		return 0, errors.New("counter overflow")
+	}
+	return current + update, nil
+}
+
 func (s *ProfileStore) BuddyIDs(id uint64) (buddies, pending []uint64, ok bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	p, ok := s.byID[id]
-	if !ok {
+	databaseID, valid := sqliteID(id)
+	if !valid {
 		return nil, nil, false
 	}
-	return append([]uint64(nil), p.Buddies...), append([]uint64(nil), p.Pending...), true
+	exists, err := profileExists(s.db, databaseID)
+	if err != nil || !exists {
+		return nil, nil, false
+	}
+	buddies, err = queryIDs(s.db, `
+		SELECT CASE WHEN user_id = ? THEN buddy_id ELSE user_id END AS other_id
+		FROM buddies
+		WHERE user_id = ? OR buddy_id = ?
+		ORDER BY other_id`, databaseID, databaseID, databaseID)
+	if err != nil {
+		return nil, nil, false
+	}
+	pending, err = queryIDs(s.db, `
+		SELECT requester_id FROM buddy_requests
+		WHERE recipient_id = ? ORDER BY requester_id`, databaseID)
+	if err != nil {
+		return nil, nil, false
+	}
+	return buddies, pending, true
+}
+
+type sqlQueryer interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+}
+
+func queryIDs(queryer sqlQueryer, query string, args ...any) ([]uint64, error) {
+	rows, err := queryer.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []uint64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		if id < 1 {
+			return nil, errors.New("profile database contains an invalid id")
+		}
+		ids = append(ids, uint64(id))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return ids, nil
 }
 
 func (s *ProfileStore) RequestBuddy(from, target uint64) error {
 	if from == target {
 		return errors.New("cannot add yourself as a buddy")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	sender, senderOK := s.byID[from]
-	receiver, receiverOK := s.byID[target]
-	if !senderOK || !receiverOK {
+	fromID, fromOK := sqliteID(from)
+	targetID, targetOK := sqliteID(target)
+	if !fromOK || !targetOK {
 		return errors.New("profile not found")
 	}
-	if containsID(sender.Buddies, target) {
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin buddy request: %w", err)
+	}
+	defer tx.Rollback()
+	if err := requireProfiles(tx, fromID, targetID); err != nil {
+		return err
+	}
+	first, second := orderedPair(fromID, targetID)
+	var buddies bool
+	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM buddies WHERE user_id = ? AND buddy_id = ?)`, first, second).Scan(&buddies); err != nil {
+		return fmt.Errorf("check buddy relationship: %w", err)
+	}
+	if buddies {
 		return errors.New("player is already a buddy")
 	}
-	if len(sender.Buddies) >= maxBuddies || len(receiver.Buddies) >= maxBuddies || len(receiver.Pending) >= maxBuddies {
+
+	senderBuddies, err := buddyCount(tx, fromID)
+	if err != nil {
+		return err
+	}
+	receiverBuddies, err := buddyCount(tx, targetID)
+	if err != nil {
+		return err
+	}
+	var pendingCount int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM buddy_requests WHERE recipient_id = ?`, targetID).Scan(&pendingCount); err != nil {
+		return fmt.Errorf("count pending buddy requests: %w", err)
+	}
+	if senderBuddies >= maxBuddies || receiverBuddies >= maxBuddies || pendingCount >= maxBuddies {
 		return errors.New("buddy list limit reached")
 	}
-	if containsID(receiver.Pending, from) {
+
+	var pending bool
+	if err := tx.QueryRow(`
+		SELECT EXISTS(SELECT 1 FROM buddy_requests WHERE requester_id = ? AND recipient_id = ?)`,
+		fromID, targetID).Scan(&pending); err != nil {
+		return fmt.Errorf("check pending buddy request: %w", err)
+	}
+	if pending {
 		return nil
 	}
-	receiver.Pending = append(receiver.Pending, from)
-	s.byID[target] = receiver
-	if err := s.saveLocked(); err != nil {
-		receiver.Pending = receiver.Pending[:len(receiver.Pending)-1]
-		s.byID[target] = receiver
-		return err
+	if _, err := tx.Exec(`INSERT INTO buddy_requests (requester_id, recipient_id) VALUES (?, ?)`, fromID, targetID); err != nil {
+		return fmt.Errorf("insert buddy request: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit buddy request: %w", err)
 	}
 	return nil
 }
@@ -329,49 +662,68 @@ func (s *ProfileStore) AcceptBuddy(user, requester uint64) error {
 	if user == requester {
 		return errors.New("cannot accept yourself as a buddy")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	u, userOK := s.byID[user]
-	r, requesterOK := s.byID[requester]
+	userID, userOK := sqliteID(user)
+	requesterID, requesterOK := sqliteID(requester)
 	if !userOK || !requesterOK {
 		return errors.New("profile not found")
 	}
-	if !containsID(u.Pending, requester) {
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin buddy acceptance: %w", err)
+	}
+	defer tx.Rollback()
+	if err := requireProfiles(tx, userID, requesterID); err != nil {
+		return err
+	}
+	result, err := tx.Exec(`DELETE FROM buddy_requests WHERE requester_id = ? AND recipient_id = ?`, requesterID, userID)
+	if err != nil {
+		return fmt.Errorf("remove buddy request: %w", err)
+	}
+	removed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("inspect buddy request removal: %w", err)
+	}
+	if removed == 0 {
 		return errors.New("buddy request not found")
 	}
-	oldU, oldR := u, r
-	u.Pending = removeID(u.Pending, requester)
-	if !containsID(u.Buddies, requester) {
-		u.Buddies = append(u.Buddies, requester)
+	first, second := orderedPair(userID, requesterID)
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO buddies (user_id, buddy_id) VALUES (?, ?)`, first, second); err != nil {
+		return fmt.Errorf("insert buddy relationship: %w", err)
 	}
-	if !containsID(r.Buddies, user) {
-		r.Buddies = append(r.Buddies, user)
-	}
-	s.byID[user], s.byID[requester] = u, r
-	if err := s.saveLocked(); err != nil {
-		s.byID[user], s.byID[requester] = oldU, oldR
-		return err
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit buddy acceptance: %w", err)
 	}
 	return nil
 }
 
 func (s *ProfileStore) RemoveBuddy(user, buddy uint64) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	u, userOK := s.byID[user]
-	b, buddyOK := s.byID[buddy]
+	userID, userOK := sqliteID(user)
+	buddyID, buddyOK := sqliteID(buddy)
 	if !userOK || !buddyOK {
 		return errors.New("profile not found")
 	}
-	oldU, oldB := u, b
-	u.Buddies = removeID(u.Buddies, buddy)
-	u.Pending = removeID(u.Pending, buddy)
-	b.Buddies = removeID(b.Buddies, user)
-	b.Pending = removeID(b.Pending, user)
-	s.byID[user], s.byID[buddy] = u, b
-	if err := s.saveLocked(); err != nil {
-		s.byID[user], s.byID[buddy] = oldU, oldB
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin buddy removal: %w", err)
+	}
+	defer tx.Rollback()
+	if err := requireProfiles(tx, userID, buddyID); err != nil {
 		return err
+	}
+	first, second := orderedPair(userID, buddyID)
+	if _, err := tx.Exec(`DELETE FROM buddies WHERE user_id = ? AND buddy_id = ?`, first, second); err != nil {
+		return fmt.Errorf("remove buddy relationship: %w", err)
+	}
+	if _, err := tx.Exec(`
+		DELETE FROM buddy_requests
+		WHERE (requester_id = ? AND recipient_id = ?)
+		   OR (requester_id = ? AND recipient_id = ?)`, userID, buddyID, buddyID, userID); err != nil {
+		return fmt.Errorf("remove pending buddy requests: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit buddy removal: %w", err)
 	}
 	return nil
 }
@@ -381,95 +733,84 @@ func (s *ProfileStore) UpdateDisplayName(id uint64, displayName string) (Profile
 	if err := validateDisplayName(displayName); err != nil {
 		return Profile{}, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	p, ok := s.byID[id]
+	databaseID, ok := sqliteID(id)
 	if !ok {
 		return Profile{}, errors.New("profile not found")
 	}
-	old := p
-	newKey := normalizeDisplayName(displayName)
-	if owner, exists := s.byDisplay[newKey]; exists && owner != id {
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return Profile{}, fmt.Errorf("begin display name update: %w", err)
+	}
+	defer tx.Rollback()
+	profile, err := queryProfile(tx, `WHERE id = ?`, databaseID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Profile{}, errors.New("profile not found")
+	}
+	if err != nil {
+		return Profile{}, fmt.Errorf("read profile: %w", err)
+	}
+	var ownerID int64
+	err = tx.QueryRow(`SELECT id FROM profiles WHERE display_name_key = ?`, normalizeDisplayName(displayName)).Scan(&ownerID)
+	switch {
+	case err == nil && ownerID != databaseID:
 		return Profile{}, errors.New("display name already exists")
+	case err != nil && !errors.Is(err, sql.ErrNoRows):
+		return Profile{}, fmt.Errorf("check display name: %w", err)
 	}
-	oldKey := normalizeDisplayName(p.DisplayName)
-	p.DisplayName = displayName
-	s.byID[id] = p
-	delete(s.byDisplay, oldKey)
-	s.byDisplay[newKey] = id
-	if err := s.saveLocked(); err != nil {
-		s.byID[id] = old
-		delete(s.byDisplay, newKey)
-		s.byDisplay[oldKey] = id
-		return Profile{}, err
+	if _, err := tx.Exec(`
+		UPDATE profiles SET display_name = ?, display_name_key = ? WHERE id = ?`,
+		displayName, normalizeDisplayName(displayName), databaseID); err != nil {
+		return Profile{}, fmt.Errorf("update display name: %w", err)
 	}
-	return p.Profile, nil
+	if err := tx.Commit(); err != nil {
+		return Profile{}, fmt.Errorf("commit display name update: %w", err)
+	}
+	profile.DisplayName = displayName
+	return profile, nil
 }
 
-func (s *ProfileStore) saveLocked() error {
-	if s.path == "" {
-		return nil
+func profileExists(queryer sqlRowQuerier, id int64) (bool, error) {
+	var exists bool
+	if err := queryer.QueryRow(`SELECT EXISTS(SELECT 1 FROM profiles WHERE id = ?)`, id).Scan(&exists); err != nil {
+		return false, err
 	}
-	db := profileDatabase{Version: 1, NextID: s.nextID, Profiles: make([]storedProfile, 0, len(s.byID))}
-	for _, p := range s.byID {
-		sort.Slice(p.Buddies, func(i, j int) bool { return p.Buddies[i] < p.Buddies[j] })
-		sort.Slice(p.Pending, func(i, j int) bool { return p.Pending[i] < p.Pending[j] })
-		db.Profiles = append(db.Profiles, p)
-	}
-	sort.Slice(db.Profiles, func(i, j int) bool { return db.Profiles[i].UserID < db.Profiles[j].UserID })
-	data, err := json.MarshalIndent(db, "", "  ")
-	if err != nil {
-		return fmt.Errorf("encode profile database: %w", err)
-	}
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
-		return fmt.Errorf("create profile database directory: %w", err)
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(s.path), ".profiles-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temporary profile database: %w", err)
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, s.path); err != nil {
-		return fmt.Errorf("publish profile database: %w", err)
+	return exists, nil
+}
+
+func requireProfiles(tx *sql.Tx, ids ...int64) error {
+	for _, id := range ids {
+		exists, err := profileExists(tx, id)
+		if err != nil {
+			return fmt.Errorf("check profile: %w", err)
+		}
+		if !exists {
+			return errors.New("profile not found")
+		}
 	}
 	return nil
 }
 
-func containsID(values []uint64, id uint64) bool {
-	for _, value := range values {
-		if value == id {
-			return true
-		}
+func buddyCount(tx *sql.Tx, id int64) (int, error) {
+	var count int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM buddies WHERE user_id = ? OR buddy_id = ?`, id, id).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count buddies: %w", err)
 	}
-	return false
+	return count, nil
 }
 
-func removeID(values []uint64, id uint64) []uint64 {
-	for i, value := range values {
-		if value == id {
-			result := make([]uint64, 0, len(values)-1)
-			result = append(result, values[:i]...)
-			result = append(result, values[i+1:]...)
-			return result
-		}
+func orderedPair(first, second int64) (int64, int64) {
+	if first > second {
+		return second, first
 	}
-	return values
+	return first, second
+}
+
+func sqliteID(id uint64) (int64, bool) {
+	if id < 1 || id > math.MaxInt64 {
+		return 0, false
+	}
+	return int64(id), true
 }
 
 func normalizeUsername(username string) string {
@@ -494,9 +835,8 @@ func validatePassword(password string) error {
 	return nil
 }
 
-// derivePassword implements PBKDF2-HMAC-SHA256 so the server has no non-standard
-// runtime dependencies. Existing database versions record their iteration count
-// implicitly; changing it requires a database format migration.
+// derivePassword implements PBKDF2-HMAC-SHA256. The iteration count is stored
+// with each profile so future schema versions can raise the cost safely.
 func derivePassword(password, salt []byte, iterations, keyLen int) []byte {
 	hashLen := sha256.Size
 	blocks := (keyLen + hashLen - 1) / hashLen

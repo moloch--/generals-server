@@ -130,15 +130,16 @@ func (c *controlClient) allowChat(now time.Time) bool {
 }
 
 type ControlServer struct {
-	cfg      Config
-	log      *slog.Logger
-	store    *ProfileStore
-	hub      *Hub
-	mu       sync.RWMutex
-	listener net.Listener
-	clients  map[*controlClient]struct{}
-	closing  bool
-	wg       sync.WaitGroup
+	cfg          Config
+	log          *slog.Logger
+	store        *ProfileStore
+	hub          *Hub
+	mu           sync.RWMutex
+	listener     net.Listener
+	clients      map[*controlClient]struct{}
+	closing      bool
+	runtimeError func(error)
+	wg           sync.WaitGroup
 }
 
 func NewControlServer(cfg Config, logger *slog.Logger, store *ProfileStore, hub *Hub) *ControlServer {
@@ -152,7 +153,7 @@ func (s *ControlServer) Start(ctx context.Context) error {
 	var listener net.Listener
 	var err error
 	if (s.cfg.TLSCertFile == "") != (s.cfg.TLSKeyFile == "") {
-		return errors.New("both -tls-cert and -tls-key are required when TLS is enabled")
+		return errors.New("both --tls-cert and --tls-key are required when TLS is enabled")
 	}
 	if s.cfg.TLSCertFile != "" {
 		cert, loadErr := tls.LoadX509KeyPair(s.cfg.TLSCertFile, s.cfg.TLSKeyFile)
@@ -216,14 +217,22 @@ func (s *ControlServer) acceptLoop(ctx context.Context, listener net.Listener) {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
+			s.mu.RLock()
+			closing := s.closing
+			s.mu.RUnlock()
+			if closing {
+				return
+			}
 			select {
 			case <-ctx.Done():
 				return
 			default:
 			}
-			if !errors.Is(err, net.ErrClosed) {
-				s.log.Warn("control accept failed", "error", err)
+			runtimeErr := fmt.Errorf("accept control connection: %w", err)
+			if s.runtimeError != nil {
+				s.runtimeError(runtimeErr)
 			}
+			s.log.Warn("control accept failed", "error", err)
 			return
 		}
 		client := &controlClient{

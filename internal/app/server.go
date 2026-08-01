@@ -14,17 +14,21 @@ import (
 )
 
 type Server struct {
-	cfg      Config
-	log      *slog.Logger
-	store    *ProfileStore
-	relay    *Relay
-	hub      *Hub
-	control  *ControlServer
-	health   *http.Server
-	healthLn net.Listener
-	cancel   context.CancelFunc
-	mu       sync.Mutex
-	started  bool
+	cfg          Config
+	log          *slog.Logger
+	store        *ProfileStore
+	relay        *Relay
+	hub          *Hub
+	control      *ControlServer
+	health       *http.Server
+	healthLn     net.Listener
+	cancel       context.CancelFunc
+	errors       chan error
+	mu           sync.Mutex
+	started      bool
+	closed       bool
+	shutdownDone chan struct{}
+	shutdownErr  error
 }
 
 func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
@@ -63,32 +67,51 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 	relay := NewRelay(cfg, logger)
 	hub := NewHub(cfg, logger, store, relay)
 	control := NewControlServer(cfg, logger, store, hub)
-	return &Server{cfg: cfg, log: logger, store: store, relay: relay, hub: hub, control: control}, nil
+	return &Server{
+		cfg: cfg, log: logger, store: store, relay: relay, hub: hub, control: control,
+		errors: make(chan error, 1),
+	}, nil
 }
 
 func (s *Server) Start(parent context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return errors.New("server is closed")
+	}
 	if s.started {
 		return errors.New("server is already started")
 	}
 	ctx, cancel := context.WithCancel(parent)
 	s.cancel = cancel
+	reportRuntimeError := func(err error) {
+		select {
+		case s.errors <- err:
+		default:
+		}
+		cancel()
+	}
+	s.relay.runtimeError = reportRuntimeError
+	s.control.runtimeError = reportRuntimeError
 	if err := s.relay.Start(ctx); err != nil {
 		cancel()
-		return err
+		s.closed = true
+		return errors.Join(err, s.store.Close())
 	}
 	if err := s.control.Start(ctx); err != nil {
 		_ = s.relay.Close()
 		cancel()
-		return err
+		s.closed = true
+		return errors.Join(err, s.store.Close())
 	}
 	listener, err := net.Listen("tcp", s.cfg.HealthAddr)
 	if err != nil {
 		_ = s.control.Close()
 		_ = s.relay.Close()
 		cancel()
-		return fmt.Errorf("listen for health requests: %w", err)
+		s.control.Wait()
+		s.closed = true
+		return errors.Join(fmt.Errorf("listen for health requests: %w", err), s.store.Close())
 	}
 	s.healthLn = listener
 	mux := http.NewServeMux()
@@ -104,8 +127,7 @@ func (s *Server) Start(parent context.Context) error {
 	}
 	go func() {
 		if err := s.health.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			s.log.Error("health server failed", "error", err)
-			cancel()
+			reportRuntimeError(fmt.Errorf("serve health requests: %w", err))
 		}
 	}()
 	s.started = true
@@ -114,39 +136,64 @@ func (s *Server) Start(parent context.Context) error {
 
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.Lock()
-	if !s.started {
+	if s.shutdownDone != nil {
+		done := s.shutdownDone
 		s.mu.Unlock()
-		return nil
+		select {
+		case <-done:
+			s.mu.Lock()
+			err := s.shutdownErr
+			s.mu.Unlock()
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
+	done := make(chan struct{})
+	s.shutdownDone = done
+	wasStarted := s.started
 	s.started = false
+	s.closed = true
 	if s.cancel != nil {
 		s.cancel()
 	}
 	health := s.health
 	s.mu.Unlock()
 
-	s.hub.CloseAll()
 	var errs []error
-	if health != nil {
-		if err := health.Shutdown(ctx); err != nil {
+	if wasStarted {
+		s.hub.CloseAll()
+		if health != nil {
+			if err := health.Shutdown(ctx); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		if err := s.control.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			errs = append(errs, err)
 		}
+		if err := s.relay.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			errs = append(errs, err)
+		}
+		controlDone := make(chan struct{})
+		go func() { s.control.Wait(); close(controlDone) }()
+		select {
+		case <-controlDone:
+		case <-ctx.Done():
+			errs = append(errs, ctx.Err())
+		}
 	}
-	if err := s.control.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+	if err := s.store.Close(); err != nil {
 		errs = append(errs, err)
 	}
-	if err := s.relay.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-		errs = append(errs, err)
-	}
-	done := make(chan struct{})
-	go func() { s.control.Wait(); close(done) }()
-	select {
-	case <-done:
-	case <-ctx.Done():
-		errs = append(errs, ctx.Err())
-	}
-	return errors.Join(errs...)
+	shutdownErr := errors.Join(errs...)
+	s.mu.Lock()
+	s.shutdownErr = shutdownErr
+	close(done)
+	s.mu.Unlock()
+	return shutdownErr
 }
+
+func (s *Server) Errors() <-chan error { return s.errors }
 
 func (s *Server) ControlAddress() string { return s.control.Address() }
 func (s *Server) RelayAddress() string   { return s.relay.Address() }

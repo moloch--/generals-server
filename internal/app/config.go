@@ -38,7 +38,7 @@ func DefaultConfig() Config {
 		RelayAddr:                ":27901",
 		HealthAddr:               ":8080",
 		PublicHost:               "localhost",
-		DataFile:                 "data/profiles.json",
+		DataFile:                 "data/profiles.db",
 		MaxControlLineBytes:      64 * 1024,
 		MaxControlConnections:    256,
 		MaxCommandsPerSecond:     60,

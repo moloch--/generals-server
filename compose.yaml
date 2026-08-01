@@ -4,10 +4,10 @@ services:
     restart: unless-stopped
     read_only: true
     command:
-      - -public-host=${GENERALS_PUBLIC_HOST:?set GENERALS_PUBLIC_HOST}
-      - -data-file=/data/profiles.json
-      - -tls-cert=/tls/fullchain.pem
-      - -tls-key=/tls/privkey.pem
+      - --public-host=${GENERALS_PUBLIC_HOST:?set GENERALS_PUBLIC_HOST}
+      - --data-file=/data/profiles.db
+      - --tls-cert=/tls/fullchain.pem
+      - --tls-key=/tls/privkey.pem
     ports:
       - "29900:29900/tcp"
       - "27901:27901/udp"

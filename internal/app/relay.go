@@ -66,11 +66,13 @@ type RelayStats struct {
 }
 
 type Relay struct {
-	cfg   Config
-	log   *slog.Logger
-	mu    sync.RWMutex
-	conn  *net.UDPConn
-	games map[uint64]*relayGame
+	cfg          Config
+	log          *slog.Logger
+	mu           sync.RWMutex
+	conn         *net.UDPConn
+	games        map[uint64]*relayGame
+	closing      bool
+	runtimeError func(error)
 
 	datagramsIn       atomic.Uint64
 	datagramsOut      atomic.Uint64
@@ -98,6 +100,7 @@ func (r *Relay) Start(ctx context.Context) error {
 	}
 	r.mu.Lock()
 	r.conn = conn
+	r.closing = false
 	r.mu.Unlock()
 	go r.serve(ctx, conn)
 	go r.expireLoop(ctx)
@@ -106,6 +109,7 @@ func (r *Relay) Start(ctx context.Context) error {
 
 func (r *Relay) Close() error {
 	r.mu.Lock()
+	r.closing = true
 	conn := r.conn
 	r.conn = nil
 	r.games = make(map[uint64]*relayGame)
@@ -241,14 +245,22 @@ func (r *Relay) serve(ctx context.Context, conn *net.UDPConn) {
 	for {
 		n, addr, err := conn.ReadFromUDP(buf)
 		if err != nil {
+			r.mu.RLock()
+			closing := r.closing
+			r.mu.RUnlock()
+			if closing {
+				return
+			}
 			select {
 			case <-ctx.Done():
 				return
 			default:
 			}
-			if !errors.Is(err, net.ErrClosed) {
-				r.log.Warn("UDP relay read failed", "error", err)
+			runtimeErr := fmt.Errorf("read UDP relay traffic: %w", err)
+			if r.runtimeError != nil {
+				r.runtimeError(runtimeErr)
 			}
+			r.log.Warn("UDP relay read failed", "error", err)
 			return
 		}
 		r.datagramsIn.Add(1)

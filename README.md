@@ -21,11 +21,11 @@ Production and service-manager guidance is in
 
 ## Run locally
 
-Go 1.22 or newer is required.
+Go 1.26 or newer is required.
 
 ```bash
 go run ./cmd/generals-server \
-  -public-host 127.0.0.1
+  --public-host 127.0.0.1
 ```
 
 Defaults are TCP `:29900`, UDP `:27901`, and HTTP `:8080`. Point the game at
@@ -58,15 +58,15 @@ Configure the public DNS name separately, then advertise it to clients:
 
 ```bash
 ./bin/generals-server \
-  -control-listen :29900 \
-  -relay-listen :27901 \
-  -public-host online.example.net \
-  -tls-cert /run/secrets/fullchain.pem \
-  -tls-key /run/secrets/privkey.pem \
-  -data-file /var/lib/generals-server/profiles.json
+  --control-listen :29900 \
+  --relay-listen :27901 \
+  --public-host online.example.net \
+  --tls-cert /run/secrets/fullchain.pem \
+  --tls-key /run/secrets/privkey.pem \
+  --data-file /var/lib/generals-server/profiles.db
 ```
 
-`-public-host` accepts a bare ASCII DNS name or IPv4 address only. Do not add a
+`--public-host` accepts a bare ASCII DNS name or IPv4 address only. Do not add a
 scheme, port, path, whitespace, or IPv6 literal; invalid values fail startup.
 
 Allow inbound TCP 29900 and UDP 27901. Firewall HTTP 8080 from the public
@@ -79,10 +79,11 @@ Players connect with certificate and hostname verification enabled:
 -onlineServer tls://online.example.net:29900
 ```
 
-The profile database is one atomically replaced JSON file, held in memory and
-serialized under a process-local lock. This is intentionally simple for a
-single-server MVP. It is not suitable for multiple replicas sharing one file,
-large user populations, audit-grade results, or concurrent external writers.
+Persistent profiles, password hashes, buddy relationships, and stats are stored
+transactionally in SQLite at `--data-file`. File-backed databases use
+write-ahead logging (WAL). Sessions, rooms, staged games, Quick Match queues,
+guest profiles, and relay allocations remain process-local, so the database is
+not a shared-state mechanism for horizontally scaled server replicas.
 
 ## Verify
 
@@ -100,13 +101,12 @@ traffic.
 - At most eight participants per staged game.
 - Defaults cap the service at 128 authenticated players, 64 staged/active
   games, 256 total control sockets, and 10,000 persistent profiles. Operators
-  may lower these limits; `-max-profiles` is bounded to 100,000 for the JSON
-  persistence backend.
+  may lower these limits; `--max-profiles` is bounded to 100,000.
 - A relay payload is at most 1,100 bytes, plus its 32-byte relay header.
 - Up to 32 initial packets per recipient are buffered until that recipient
   binds its UDP endpoint; later overflow is dropped and counted.
 - Relay credentials must be confirmed by every participant within 15 seconds
-  (`-start-ready-timeout`) before `game.go` authorizes retail launch.
+  (`--start-ready-timeout`) before `game.go` authorizes retail launch.
 - Chat is ephemeral; it is not persisted.
 - Chat and general control commands are rate limited per connection.
 - Guest profiles cannot use persistent buddies or stats.
