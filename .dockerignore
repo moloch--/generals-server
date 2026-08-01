@@ -1,0 +1,9 @@
+.git
+bin
+data
+tls
+coverage.out
+*.log
+*.test
+*.exe
+generals-server

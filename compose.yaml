@@ -1,0 +1,26 @@
+services:
+  generals-server:
+    build: .
+    restart: unless-stopped
+    read_only: true
+    command:
+      - -public-host=${GENERALS_PUBLIC_HOST:?set GENERALS_PUBLIC_HOST}
+      - -data-file=/data/profiles.json
+      - -tls-cert=/tls/fullchain.pem
+      - -tls-key=/tls/privkey.pem
+    ports:
+      - "29900:29900/tcp"
+      - "27901:27901/udp"
+      - "127.0.0.1:8080:8080/tcp"
+    volumes:
+      - generals-data:/data
+      - ./tls:/tls:ro
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  generals-data:
