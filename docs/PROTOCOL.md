@@ -116,7 +116,7 @@ acceptance-only slot-list echo with the same key does not.
 ```json
 {
   "product":"zerohour",
-  "compatibility_version":1,
+  "compatibility_version":2,
   "ini_crc":1865069505,
   "game_id":"0123456789abcdef",
   "name":"No Rush",
@@ -132,7 +132,8 @@ acceptance-only slot-list echo with the same key does not.
 The top-level compatibility tuple is immutable for the lifetime of the game:
 
 - `product` is exactly `generals` or `zerohour`;
-- `compatibility_version` is currently `1`;
+- `compatibility_version` is currently `2`; generation `1` clients used the
+  earlier platform-native simulation math contract and are rejected;
 - `ini_crc` is the client's unsigned 32-bit checksum of compatibility-relevant
   game INI data.
 
@@ -148,7 +149,7 @@ snapshot adds `members` and the complete `options` object:
 ```json
 {
   "product":"zerohour",
-  "compatibility_version":1,
+  "compatibility_version":2,
   "ini_crc":1865069505,
   "game_id":"0123456789abcdef",
   "name":"No Rush",
@@ -274,8 +275,8 @@ Chat sends:
 | Command | Request `data` | Successful response `data` |
 |---|---|---|
 | `game.list` | `{}` | `{"games":[GameSummary,...]}` |
-| `game.create` | `{"product":"zerohour","compatibility_version":1,"ini_crc":1865069505,"name":"Game","password":"","max_players":8,"options":GameOptions}` | `{"game":GameSnapshot}` |
-| `game.join` | `{"product":"zerohour","compatibility_version":1,"ini_crc":1865069505,"game_id":"0123456789abcdef","password":""}` | `{"game":GameSnapshot}` |
+| `game.create` | `{"product":"zerohour","compatibility_version":2,"ini_crc":1865069505,"name":"Game","password":"","max_players":8,"options":GameOptions}` | `{"game":GameSnapshot}` |
+| `game.join` | `{"product":"zerohour","compatibility_version":2,"ini_crc":1865069505,"game_id":"0123456789abcdef","password":""}` | `{"game":GameSnapshot}` |
 | `game.leave` | `{}` | `{"left":true}` |
 | `game.options` | Any subset of `name`, `password`, `max_players`, `options` | `{"game":GameSnapshot}` |
 | `game.ready` | `{"ready":true}` | `{"ready":true}` |
@@ -450,13 +451,13 @@ storage error can be retried.
 
 | Command | Request `data` | Successful response `data` |
 |---|---|---|
-| `quickmatch.enqueue` | `{"product":"zerohour","compatibility_version":1,"ini_crc":1865069505,"mode":"1v1"}` | Queued or matched result |
+| `quickmatch.enqueue` | `{"product":"zerohour","compatibility_version":2,"ini_crc":1865069505,"mode":"1v1"}` | Queued or matched result |
 | `quickmatch.cancel` | `{}` | `{"cancelled":true}` |
 
 The first player waits. A queued response echoes the immutable matching key:
 
 ```json
-{"queued":true,"mode":"1v1","product":"zerohour","compatibility_version":1,"ini_crc":1865069505}
+{"queued":true,"mode":"1v1","product":"zerohour","compatibility_version":2,"ini_crc":1865069505}
 ```
 
 Only a second waiting player with the identical mode, product, compatibility

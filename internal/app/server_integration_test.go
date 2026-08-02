@@ -317,9 +317,16 @@ func TestGameCompatibilityIsReportedAndRejectsMismatchedJoin(t *testing.T) {
 	if invalidQuickmatch.OK == nil || *invalidQuickmatch.OK || invalidQuickmatch.Code != "invalid_compatibility" {
 		t.Fatalf("quickmatch with unsupported compatibility version response: %+v", invalidQuickmatch)
 	}
+	legacyVersion := testGameCompatibility
+	legacyVersion.CompatibilityVersion = 1
+	legacyQuickmatch := joiner.commandResponse("quickmatch.enqueue", requestWithCompatibility(map[string]any{"mode": "1v1"}, legacyVersion))
+	if legacyQuickmatch.OK == nil || *legacyQuickmatch.OK || legacyQuickmatch.Code != "invalid_compatibility" {
+		t.Fatalf("quickmatch with legacy compatibility generation response: %+v", legacyQuickmatch)
+	}
 
 	mismatches := []GameCompatibility{
 		{Product: "generals", CompatibilityVersion: GameCompatibilityVersion, INICRC: testINICRC},
+		{Product: "zerohour", CompatibilityVersion: 1, INICRC: testINICRC},
 		{Product: "zerohour", CompatibilityVersion: GameCompatibilityVersion + 1, INICRC: testINICRC},
 		{Product: "zerohour", CompatibilityVersion: GameCompatibilityVersion, INICRC: testINICRC + 1},
 		{},
