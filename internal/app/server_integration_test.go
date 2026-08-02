@@ -92,6 +92,29 @@ func TestServerTwoClientOnlineFlowAndUDPRelay(t *testing.T) {
 		t.Fatal("guest IDs collided")
 	}
 
+	selfStats := host.command("stats.get", map[string]any{})
+	var selfStatsData struct {
+		UserID uint64      `json:"user_id"`
+		Stats  PlayerStats `json:"stats"`
+	}
+	decodeWireData(t, selfStats, &selfStatsData)
+	if selfStatsData.UserID != hostAuthData.Profile.UserID || selfStatsData.Stats != (PlayerStats{}) {
+		t.Fatalf("unexpected guest self stats: %+v", selfStatsData)
+	}
+	peerStats := host.command("stats.get", map[string]any{"user_id": peerAuthData.Profile.UserID})
+	var peerStatsData struct {
+		UserID uint64      `json:"user_id"`
+		Stats  PlayerStats `json:"stats"`
+	}
+	decodeWireData(t, peerStats, &peerStatsData)
+	if peerStatsData.UserID != peerAuthData.Profile.UserID || peerStatsData.Stats != (PlayerStats{}) {
+		t.Fatalf("unexpected guest peer stats: %+v", peerStatsData)
+	}
+	guestUpdate := host.commandResponse("stats.update", map[string]any{"delta": PlayerStats{Wins: 1, Games: 1}})
+	if guestUpdate.OK == nil || *guestUpdate.OK || guestUpdate.Code != "persistent_profile_required" {
+		t.Fatalf("guest stats update response: %+v", guestUpdate)
+	}
+
 	host.command("room.chat", map[string]any{"message": "hello room", "action": false})
 	roomChat := peer.requireEvent("room.chat")
 	var roomChatData struct {
