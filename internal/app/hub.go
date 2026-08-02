@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -290,6 +291,10 @@ func (h *Hub) Disconnect(client *controlClient) {
 	if h.clients[client.profile.UserID] != client {
 		return
 	}
+	h.disconnectLocked(client)
+}
+
+func (h *Hub) disconnectLocked(client *controlClient) {
 	delete(h.clients, client.profile.UserID)
 	delete(h.displayOwners, normalizeDisplayName(client.profile.DisplayName))
 	delete(h.matchQueue, client.profile.UserID)
@@ -379,6 +384,114 @@ func (h *Hub) Stats() HubStats {
 		}
 	}
 	return stats
+}
+
+func (h *Hub) AdminSnapshot() adminHubSnapshot {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	snapshot := adminHubSnapshot{
+		Sessions: make([]adminSession, 0, len(h.clients)),
+		Games:    make([]adminGame, 0, len(h.games)),
+	}
+	for userID, client := range h.clients {
+		session := adminSession{
+			UserID:           strconv.FormatUint(userID, 10),
+			Username:         client.profile.Username,
+			DisplayName:      client.profile.DisplayName,
+			Guest:            client.profile.Guest,
+			CreatedAt:        client.profile.CreatedAt.UTC().Format(time.RFC3339Nano),
+			Status:           client.status,
+			RoomID:           h.userRoom[userID],
+			QuickmatchQueued: h.matchQueue[userID].client != nil,
+		}
+		if session.Status == "" {
+			session.Status = "online"
+		}
+		if gameID, exists := h.userGame[userID]; exists {
+			session.GameID = formatGameID(gameID)
+		}
+		snapshot.Sessions = append(snapshot.Sessions, session)
+	}
+	sort.Slice(snapshot.Sessions, func(i, j int) bool {
+		first := strings.ToLower(snapshot.Sessions[i].DisplayName)
+		second := strings.ToLower(snapshot.Sessions[j].DisplayName)
+		if first != second {
+			return first < second
+		}
+		return snapshot.Sessions[i].UserID < snapshot.Sessions[j].UserID
+	})
+
+	for _, game := range h.games {
+		members := make([]adminMember, 0, len(game.members))
+		hostName := ""
+		for userID, member := range game.members {
+			if member.client == nil {
+				continue
+			}
+			name := member.client.profile.DisplayName
+			if userID == game.hostID {
+				hostName = name
+			}
+			members = append(members, adminMember{
+				UserID:      strconv.FormatUint(userID, 10),
+				DisplayName: name,
+				Host:        userID == game.hostID,
+				Ready:       member.ready,
+				Slot:        member.slot,
+			})
+		}
+		sort.Slice(members, func(i, j int) bool {
+			if members[i].Slot != members[j].Slot {
+				return members[i].Slot < members[j].Slot
+			}
+			return members[i].UserID < members[j].UserID
+		})
+		snapshot.Games = append(snapshot.Games, adminGame{
+			GameCompatibility: game.compatibility,
+			GameID:            formatGameID(game.id),
+			Name:              game.name,
+			Map:               game.options.Map,
+			HostName:          hostName,
+			Players:           len(members),
+			MaxPlayers:        game.maxPlayers,
+			HasPassword:       game.password != "",
+			State:             game.state,
+			Listed:            game.listed,
+			Members:           members,
+			Options:           game.options,
+		})
+	}
+	sort.Slice(snapshot.Games, func(i, j int) bool {
+		return snapshot.Games[i].GameID < snapshot.Games[j].GameID
+	})
+	return snapshot
+}
+
+func (h *Hub) AdminDisconnect(userID uint64) bool {
+	h.mu.Lock()
+	client := h.clients[userID]
+	if client != nil {
+		h.disconnectLocked(client)
+	}
+	h.mu.Unlock()
+	if client == nil {
+		return false
+	}
+	client.event("session.closed", map[string]any{"reason": "disconnected_by_admin"})
+	client.close()
+	return true
+}
+
+func (h *Hub) AdminCloseGame(gameID uint64) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	game := h.games[gameID]
+	if game == nil {
+		return false
+	}
+	h.dissolveGameLocked(game, "closed_by_admin", nil)
+	return true
 }
 
 func (h *Hub) CloseAll() {

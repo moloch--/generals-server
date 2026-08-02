@@ -1,8 +1,12 @@
 .git
+.env
+admin-token
 bin
+coverage.out
 data
 tls
-coverage.out
+web/.heroui
+web/node_modules
 *.log
 *.test
 *.exe

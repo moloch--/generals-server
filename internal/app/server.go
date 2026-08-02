@@ -22,6 +22,9 @@ type Server struct {
 	control      *ControlServer
 	health       *http.Server
 	healthLn     net.Listener
+	admin        *http.Server
+	adminLn      net.Listener
+	adminToken   adminTokenHash
 	cancel       context.CancelFunc
 	errors       chan error
 	mu           sync.Mutex
@@ -60,6 +63,17 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 	if cfg.ControlReadTimeout <= 0 || cfg.ControlWriteTimeout <= 0 {
 		return nil, errors.New("control read and write timeouts must be positive")
 	}
+	if (cfg.AdminAddr == "") != (cfg.AdminTokenFile == "") {
+		return nil, errors.New("both --admin-listen and --admin-token-file are required when the admin server is enabled")
+	}
+	var adminToken adminTokenHash
+	if cfg.AdminAddr != "" {
+		var err error
+		adminToken, err = loadAdminTokenHash(cfg.AdminTokenFile)
+		if err != nil {
+			return nil, err
+		}
+	}
 	store, err := OpenProfileStoreWithLimit(cfg.DataFile, cfg.MaxProfiles)
 	if err != nil {
 		return nil, err
@@ -69,7 +83,7 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 	control := NewControlServer(cfg, logger, store, hub)
 	return &Server{
 		cfg: cfg, log: logger, store: store, relay: relay, hub: hub, control: control,
-		errors: make(chan error, 1),
+		adminToken: adminToken, errors: make(chan error, 1),
 	}, nil
 }
 
@@ -113,6 +127,19 @@ func (s *Server) Start(parent context.Context) error {
 		s.closed = true
 		return errors.Join(fmt.Errorf("listen for health requests: %w", err), s.store.Close())
 	}
+	var adminListener net.Listener
+	if s.cfg.AdminAddr != "" {
+		adminListener, err = net.Listen("tcp", s.cfg.AdminAddr)
+		if err != nil {
+			_ = listener.Close()
+			_ = s.control.Close()
+			_ = s.relay.Close()
+			cancel()
+			s.control.Wait()
+			s.closed = true
+			return errors.Join(fmt.Errorf("listen for admin requests: %w", err), s.store.Close())
+		}
+	}
 	s.healthLn = listener
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealth)
@@ -124,12 +151,32 @@ func (s *Server) Start(parent context.Context) error {
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    16 * 1024,
+	}
+	startedAt := time.Now().UTC()
+	if adminListener != nil {
+		s.adminLn = adminListener
+		s.admin = &http.Server{
+			Handler:           newAdminHandler(s.adminToken, s.store, s.hub, s.relay, s.log, startedAt),
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       10 * time.Second,
+			WriteTimeout:      10 * time.Second,
+			IdleTimeout:       30 * time.Second,
+			MaxHeaderBytes:    16 * 1024,
+		}
 	}
 	go func() {
 		if err := s.health.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			reportRuntimeError(fmt.Errorf("serve health requests: %w", err))
 		}
 	}()
+	if s.admin != nil {
+		go func() {
+			if err := s.admin.Serve(adminListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				reportRuntimeError(fmt.Errorf("serve admin requests: %w", err))
+			}
+		}()
+	}
 	s.started = true
 	return nil
 }
@@ -158,10 +205,17 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.cancel()
 	}
 	health := s.health
+	admin := s.admin
 	s.mu.Unlock()
 
 	var errs []error
 	if wasStarted {
+		if admin != nil {
+			if err := admin.Shutdown(ctx); err != nil {
+				errs = append(errs, err)
+				_ = admin.Close()
+			}
+		}
 		s.hub.CloseAll()
 		if health != nil {
 			if err := health.Shutdown(ctx); err != nil {
@@ -204,6 +258,15 @@ func (s *Server) HealthAddress() string {
 		return s.healthLn.Addr().String()
 	}
 	return s.cfg.HealthAddr
+}
+
+func (s *Server) AdminAddress() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.adminLn != nil {
+		return s.adminLn.Addr().String()
+	}
+	return s.cfg.AdminAddr
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -44,6 +45,11 @@ type ProfileStore struct {
 	maxProfiles int
 	closeOnce   sync.Once
 	closeErr    error
+}
+
+type storedAdminProfile struct {
+	Profile Profile
+	Stats   PlayerStats
 }
 
 type sqlRowScanner interface {
@@ -281,6 +287,101 @@ func (s *ProfileStore) Close() error {
 		}
 	})
 	return s.closeErr
+}
+
+func (s *ProfileStore) profileCount(ctx context.Context) (uint64, error) {
+	var count int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM profiles`).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count profiles: %w", err)
+	}
+	if count < 0 {
+		return 0, errors.New("profile database returned a negative profile count")
+	}
+	return uint64(count), nil
+}
+
+func (s *ProfileStore) listAdminProfiles(ctx context.Context, search string, limit, offset int) ([]storedAdminProfile, uint64, error) {
+	if limit < 1 || limit > 100 {
+		return nil, 0, errors.New("profile page limit must be between 1 and 100")
+	}
+	if offset < 0 || offset > maxSupportedProfiles {
+		return nil, 0, fmt.Errorf("profile page offset must be between 0 and %d", maxSupportedProfiles)
+	}
+
+	search = strings.TrimSpace(search)
+	predicate := ""
+	var filterArgs []any
+	if search != "" {
+		pattern := "%" + escapeSQLiteLike(strings.ToLower(search)) + "%"
+		predicate = ` WHERE username_key LIKE ? ESCAPE '\' OR display_name_key LIKE ? ESCAPE '\'`
+		filterArgs = []any{pattern, pattern}
+	}
+
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, 0, fmt.Errorf("begin admin profile query: %w", err)
+	}
+	defer tx.Rollback()
+
+	var count int64
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM profiles`+predicate, filterArgs...).Scan(&count); err != nil {
+		return nil, 0, fmt.Errorf("count admin profiles: %w", err)
+	}
+	if count < 0 {
+		return nil, 0, errors.New("profile database returned a negative profile count")
+	}
+
+	queryArgs := append(append([]any(nil), filterArgs...), limit, offset)
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id, username, display_name, created_at,
+		       wins, losses, disconnects, games, rating
+		FROM profiles`+predicate+`
+		ORDER BY id DESC
+		LIMIT ? OFFSET ?`, queryArgs...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list admin profiles: %w", err)
+	}
+	profiles := make([]storedAdminProfile, 0, limit)
+	for rows.Next() {
+		var record storedAdminProfile
+		var id int64
+		var createdAt string
+		if err := rows.Scan(
+			&id, &record.Profile.Username, &record.Profile.DisplayName, &createdAt,
+			&record.Stats.Wins, &record.Stats.Losses, &record.Stats.Disconnects,
+			&record.Stats.Games, &record.Stats.Rating,
+		); err != nil {
+			rows.Close()
+			return nil, 0, fmt.Errorf("scan admin profile: %w", err)
+		}
+		if id < 1 {
+			rows.Close()
+			return nil, 0, errors.New("profile database contains an invalid id")
+		}
+		created, err := time.Parse(time.RFC3339Nano, createdAt)
+		if err != nil {
+			rows.Close()
+			return nil, 0, errors.New("profile database contains an invalid creation time")
+		}
+		record.Profile.UserID = uint64(id)
+		record.Profile.CreatedAt = created
+		profiles = append(profiles, record)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, 0, fmt.Errorf("iterate admin profiles: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, 0, fmt.Errorf("close admin profile query: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, 0, fmt.Errorf("finish admin profile query: %w", err)
+	}
+	return profiles, uint64(count), nil
+}
+
+func escapeSQLiteLike(value string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(value)
 }
 
 func (s *ProfileStore) Register(username, password, displayName string) (Profile, error) {

@@ -12,6 +12,12 @@ can front the control listener, but it cannot replace the UDP port; preserve the
 original long-lived TCP connection and route UDP directly to the same server
 process.
 
+The optional admin listener exposes an embedded web dashboard and REST API.
+Keep it on a private management interface. The Compose deployment publishes
+TCP 8081 only on `GENERALS_ADMIN_HOST`, which should be the exact IPv4 address
+reported by `tailscale ip -4`. A plain `8081:8081` mapping is unsafe because it
+binds every host interface.
+
 Set `--public-host` to a DNS name resolvable by every player. This value is sent
 in per-player `game.started` events. It may differ from the control listener's
 bind address, but it must be a bare ASCII DNS name or IPv4 address without a
@@ -81,29 +87,125 @@ multi-node datastore; pointing replicas at one SQLite file is unsupported.
 
 ## Container deployment
 
-Place the TLS files in `tls/fullchain.pem` and `tls/privkey.pem`, then set the
-advertised DNS name:
+The Compose deployment keeps the database in a normal host directory instead
+of a Docker-managed volume. Create private data and TLS directories, generate
+a private admin bearer token, copy the example environment, and set the
+advertised host, Tailscale IPv4 address, plus your numeric host user and group
+IDs:
 
 ```bash
-mkdir -p tls
-export GENERALS_PUBLIC_HOST=online.example.net
+install -d -m 0700 "$HOME/generals-data" "$PWD/tls"
+umask 077
+openssl rand -base64 48 > "$PWD/admin-token"
+cp .env.example .env
+# Edit .env: set GENERALS_PUBLIC_HOST, GENERALS_DATA_DIR, GENERALS_TLS_DIR,
+# GENERALS_ADMIN_HOST from `tailscale ip -4`, GENERALS_ADMIN_TOKEN_FILE,
+# GENERALS_UID from `id -u`, GENERALS_GID from `id -g`, and the certificate
+# lineage name used by Certbot.
+install -m 0600 /secure/source/fullchain.pem "$PWD/tls/fullchain.pem"
+install -m 0600 /secure/source/privkey.pem "$PWD/tls/privkey.pem"
 docker compose up --build -d
 ```
 
-The compose definition publishes operations HTTP on host loopback only, drops
-Linux capabilities, uses a read-only container filesystem, and persists the
-SQLite database in the Compose-managed `generals-data` volume. The image
-creates `/data` for uid 65532 before the empty volume is initialized, so the
-non-root service can write its database without weakening host-directory
-permissions. Certificate files must remain readable by container uid 65532
-without making the private key world-readable.
+The TLS copy commands are mandatory: Compose intentionally refuses to create
+or populate the configured TLS directory. To issue a Let's Encrypt IP
+certificate instead of copying an existing certificate, first create the ACME
+state volume and request the short-lived certificate while public TCP port 80
+is free:
 
-`docker compose down` preserves the profile volume. Do not use
-`docker compose down -v` unless deleting all persistent account data is
-intentional. Stop the service before making a file-level volume backup, or use a
-SQLite-consistent online backup. Include the complete named volume so WAL and
-shared-memory sidecars cannot be omitted; its concrete Docker name can be found
-with `docker volume ls --filter label=com.docker.compose.project`.
+```bash
+docker volume create generals-server-letsencrypt
+docker run --rm \
+  --publish 0.0.0.0:80:80/tcp \
+  --volume generals-server-letsencrypt:/etc/letsencrypt \
+  certbot/certbot:v5.4.0 certonly \
+  --standalone --non-interactive --agree-tos \
+  --email operator@example.net \
+  --preferred-profile shortlived \
+  --cert-name online-example-net \
+  --ip-address 203.0.113.10
+./deployments/renew-certificate.sh
+docker compose up --build -d
+```
+
+Set the same certificate name in `.env`. Replace the example email and IP; for
+a DNS certificate, use Certbot's `--domains` option instead. The renewal script
+uses the existing Certbot lineage, atomically refreshes the private host TLS
+directory, preserves mode `0600` and the configured host ownership, and
+restarts the Compose container only when the certificate changed.
+
+Install the script in the service user's crontab. Logging through `logger`
+keeps output under the host journal's rotation policy instead of appending to
+an unbounded file:
+
+```cron
+17 3,15 * * * /absolute/path/generals-server/deployments/renew-certificate.sh 2>&1 | /usr/bin/logger -t generals-server-cert-renew
+```
+
+After the first build, routine lifecycle commands need no extra flags:
+
+```bash
+docker compose up -d
+docker compose logs -f
+docker compose restart
+docker compose down
+```
+
+The compose definition publishes operations HTTP on host loopback only and the
+admin service on the exact Tailscale IPv4 address only. It drops Linux
+capabilities, uses a read-only container filesystem, and bind-mounts
+`GENERALS_DATA_DIR` at `/data`. It runs as `GENERALS_UID:GENERALS_GID`, so
+`profiles.db` and any WAL sidecars remain owned and directly accessible by the
+host service account. `create_host_path: false` deliberately makes startup
+fail if a configured path is missing instead of silently creating a root-owned
+path. Keep both directories mode `0700`; certificate files and the admin token
+should be mode `0600`.
+
+`docker compose down` removes containers and networks but does not touch the
+host database directory. Stop the service before making a file-level backup,
+then copy the complete `GENERALS_DATA_DIR`; do not omit WAL or shared-memory
+sidecars. Keep backups outside that directory and test restoration with an
+isolated server process.
+
+## Admin dashboard and REST API
+
+Start the admin listener only with both flags:
+
+```bash
+generals-server \
+  --admin-listen 100.64.0.1:8081 \
+  --admin-token-file /etc/generals-server/admin-token
+```
+
+The web interface is available at `/admin/`. Its JavaScript, CSS, and HTML are
+compiled into `internal/app/adminui/dist` and embedded directly in the Go
+binary with `embed.FS`; there is no runtime web directory to mount or manage.
+The login screen retains the bearer token only in the current browser tab's
+`sessionStorage`.
+
+Every endpoint below requires `Authorization: Bearer <token>` and returns a
+JSON `data` envelope except successful DELETE requests, which return 204:
+
+- `GET /api/admin/v1/overview`: process, hub, and relay counters.
+- `GET /api/admin/v1/profiles?query=&limit=&offset=`: searchable profile page.
+- `GET /api/admin/v1/sessions`: active control sessions.
+- `DELETE /api/admin/v1/sessions/{userID}`: disconnect one player.
+- `GET /api/admin/v1/games`: staged and active games.
+- `DELETE /api/admin/v1/games/{gameID}`: close a game and remove its members.
+
+Profile, player, game, and counter identifiers that could exceed JavaScript's
+safe integer range are serialized as strings. The server does not enable CORS,
+the API never returns credentials, and disruptive actions are logged by ID.
+
+From another device on the same tailnet, open:
+
+```text
+http://<tailscale-name-or-ip>:8081/admin/
+```
+
+No public firewall port is required for this listener. Verify the host binding
+after deployment with `docker compose ps` and `ss -ltn`; it must show the
+Tailscale address, not `0.0.0.0:8081` or `[::]:8081`.
 
 ## systemd deployment
 

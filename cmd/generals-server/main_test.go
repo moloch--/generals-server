@@ -16,6 +16,8 @@ import (
 )
 
 var existingServerFlagNames = []string{
+	"admin-listen",
+	"admin-token-file",
 	"allow-insecure-password-auth",
 	"control-listen",
 	"data-file",
@@ -43,6 +45,7 @@ type fakeOnlineServer struct {
 	controlAddr string
 	relayAddr   string
 	healthAddr  string
+	adminAddr   string
 	errors      <-chan error
 }
 
@@ -63,6 +66,7 @@ func (server *fakeOnlineServer) Shutdown(ctx context.Context) error {
 func (server *fakeOnlineServer) ControlAddress() string { return server.controlAddr }
 func (server *fakeOnlineServer) RelayAddress() string   { return server.relayAddr }
 func (server *fakeOnlineServer) HealthAddress() string  { return server.healthAddr }
+func (server *fakeOnlineServer) AdminAddress() string   { return server.adminAddr }
 func (server *fakeOnlineServer) Errors() <-chan error   { return server.errors }
 
 func TestRootCommandRegistersExistingFlags(t *testing.T) {
@@ -106,6 +110,8 @@ func TestRootCommandBindsAllFlags(t *testing.T) {
 		"--control-listen=127.0.0.1:31000",
 		"--relay-listen", "127.0.0.1:31001",
 		"--health-listen=127.0.0.1:31002",
+		"--admin-listen=127.0.0.1:31003",
+		"--admin-token-file=/run/secrets/admin-token",
 		"--public-host", "relay.example.net",
 		"--data-file=/var/lib/generals/profiles.db",
 		"--tls-cert", "/run/tls/cert.pem",
@@ -132,6 +138,8 @@ func TestRootCommandBindsAllFlags(t *testing.T) {
 	want.ControlAddr = "127.0.0.1:31000"
 	want.RelayAddr = "127.0.0.1:31001"
 	want.HealthAddr = "127.0.0.1:31002"
+	want.AdminAddr = "127.0.0.1:31003"
+	want.AdminTokenFile = "/run/secrets/admin-token"
 	want.PublicHost = "relay.example.net"
 	want.DataFile = "/var/lib/generals/profiles.db"
 	want.TLSCertFile = "/run/tls/cert.pem"
@@ -272,6 +280,7 @@ func TestServerLifecycleUsesIndependentShutdownContext(t *testing.T) {
 		controlAddr: "127.0.0.1:29900",
 		relayAddr:   "127.0.0.1:27901",
 		healthAddr:  "127.0.0.1:8080",
+		adminAddr:   "",
 	}
 	factory := func(app.Config, *slog.Logger) (onlineServer, error) { return server, nil }
 	var stdout bytes.Buffer
@@ -319,6 +328,7 @@ func TestServerLifecycleUsesIndependentShutdownContext(t *testing.T) {
 		"control=127.0.0.1:29900",
 		"relay=127.0.0.1:27901",
 		"health=127.0.0.1:8080",
+		"admin=\"\"",
 		"public_host=relay.example.net",
 	} {
 		if !strings.Contains(stdout.String(), text) {

@@ -1,0 +1,62 @@
+{
+  "name": "generals-server-admin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "allowScripts": {
+    "@heroui-pro/react@1.0.0-beta.7": true,
+    "@zowe/secrets-for-zowe-sdk": false,
+    "fsevents": false
+  },
+  "scripts": {
+    "dev": "vite",
+    "typecheck": "tsc --noEmit",
+    "build": "npm run typecheck && vite build"
+  },
+  "dependencies": {
+    "@fortawesome/fontawesome-svg-core": "7.3.1",
+    "@fortawesome/free-solid-svg-icons": "7.3.1",
+    "@fortawesome/react-fontawesome": "3.5.0",
+    "@heroui-pro/react": "1.0.0-beta.7",
+    "@heroui/react": "3.2.3",
+    "@heroui/styles": "3.2.3",
+    "@number-flow/react": "^0.6.2",
+    "@tiptap/core": "^3.29.2",
+    "@tiptap/extension-link": "^3.29.2",
+    "@tiptap/extension-underline": "^3.29.2",
+    "@tiptap/extensions": "^3.29.2",
+    "@tiptap/pm": "^3.29.2",
+    "@tiptap/react": "^3.29.2",
+    "@tiptap/starter-kit": "^3.29.2",
+    "@tiptap/suggestion": "^3.29.2",
+    "embla-carousel": "^8.6.0",
+    "embla-carousel-react": "^8.6.0",
+    "maplibre-gl": "^6.1.0",
+    "marked": "^18.0.7",
+    "motion": "^12.43.0",
+    "react": "19.2.8",
+    "react-aria-components": "^1.20.0",
+    "react-dom": "19.2.8",
+    "react-markdown": "^10.1.0",
+    "react-resizable-panels": "^4.12.2",
+    "recharts": "^3.10.1",
+    "remark-breaks": "^4.0.0",
+    "remark-gfm": "^4.0.1",
+    "shiki": "^4.4.1",
+    "streamdown": "^2.5.0",
+    "tailwind-merge": "^3.6.0",
+    "tailwind-variants": "^3.3.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "4.3.3",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "@vitejs/plugin-react": "6.0.5",
+    "tailwindcss": "4.3.3",
+    "typescript": "7.0.2",
+    "vite": "8.2.0"
+  },
+  "overrides": {
+    "tar": "7.5.22"
+  }
+}

@@ -13,7 +13,8 @@ The server provides:
   launch, host coordination, and basic results/stats;
 - basic two-player quickmatch keyed by mode and the exact compatibility tuple;
 - a token-authenticated, slot-aware UDP relay for opaque game traffic;
-- JSON health output and Prometheus metrics.
+- JSON health output and Prometheus metrics;
+- a bearer-authenticated REST API and embedded HeroUI Pro admin dashboard.
 
 The exact client contract is [docs/PROTOCOL.md](docs/PROTOCOL.md).
 Production and service-manager guidance is in
@@ -46,6 +47,12 @@ curl http://127.0.0.1:8080/healthz
 curl http://127.0.0.1:8080/metrics
 ```
 
+The admin service is disabled unless both `--admin-listen` and
+`--admin-token-file` are set. The token file must contain at least 32 printable
+ASCII bytes and be accessible only by its owner. In production, publish this
+listener only on a private interface such as Tailscale; the supplied Compose
+deployment binds it to the exact address in `GENERALS_ADMIN_HOST`.
+
 ## Internet deployment
 
 Build a static server binary where supported:
@@ -73,6 +80,10 @@ Allow inbound TCP 29900 and UDP 27901. Firewall HTTP 8080 from the public
 Internet or bind it to a private monitoring interface. The control protocol supports native TLS; do
 not enable insecure password auth on an Internet-facing plaintext listener.
 
+The admin dashboard and REST API use TCP 8081 in the Compose deployment, bound
+only to the configured Tailscale IPv4 address. Do not open that port on the
+public firewall.
+
 Players connect with certificate and hostname verification enabled:
 
 ```text
@@ -84,6 +95,35 @@ transactionally in SQLite at `--data-file`. File-backed databases use
 write-ahead logging (WAL). Sessions, rooms, staged games, Quick Match queues,
 guest profiles, and relay allocations remain process-local, so the database is
 not a shared-state mechanism for horizontally scaled server replicas.
+
+For Docker Compose, copy `.env.example` to `.env`, point
+`GENERALS_DATA_DIR` at a private host directory such as
+`/home/your-user/generals-data`, install the TLS files in
+`GENERALS_TLS_DIR`, and run `docker compose up --build -d`. Subsequent starts
+use `docker compose up -d`; the host directory remains intact across
+`docker compose down`. See [docs/OPERATIONS.md](docs/OPERATIONS.md) for the
+directory permissions and backup procedure.
+
+## Admin web build
+
+The authored React application is under `web/`. Its production output is
+written to `internal/app/adminui/dist`, where the Go standard library's
+`embed` package includes the complete asset tree in the server binary. The
+scratch runtime image therefore contains no Node runtime, `node_modules`, or
+loose web files. The dashboard uses HeroUI Pro, Font Awesome Free, and the same
+GeneralsXZH icon source used by the packaged macOS application.
+
+To regenerate the embedded assets, authenticate the HeroUI Pro CLI and run:
+
+```bash
+cd web
+npm ci
+npm run build
+```
+
+The generated application assets are checked in so normal Go and Docker builds
+do not require HeroUI credentials. Never commit the local HeroUI cache,
+`node_modules`, or an admin token.
 
 ## Verify
 

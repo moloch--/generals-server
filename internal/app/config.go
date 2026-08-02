@@ -11,6 +11,8 @@ type Config struct {
 	ControlAddr               string
 	RelayAddr                 string
 	HealthAddr                string
+	AdminAddr                 string
+	AdminTokenFile            string
 	PublicHost                string
 	DataFile                  string
 	TLSCertFile               string

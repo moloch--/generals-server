@@ -2,6 +2,11 @@
 /data/
 /generals-server
 /coverage.out
+.env
 *.log
 *.test
 *.exe
+/tls/
+/admin-token
+/web/.heroui/
+/web/node_modules/
