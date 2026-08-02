@@ -1414,6 +1414,16 @@ func (h *Hub) handleStartReadyTimeout(gameID, generation uint64) {
 	h.dissolveGameLocked(game, "start_timeout", nil)
 }
 
+func (h *Hub) handleRelayGameExpired(gameID uint64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	game := h.games[gameID]
+	if game == nil || (game.state != "starting" && game.state != "started") {
+		return
+	}
+	h.dissolveGameLocked(game, "relay_idle_timeout", nil)
+}
+
 func (h *Hub) refreshSnapshotsForUserLocked(userID uint64) {
 	if roomID := h.userRoom[userID]; roomID != "" {
 		h.broadcastRoomSnapshotLocked(h.rooms[roomID])

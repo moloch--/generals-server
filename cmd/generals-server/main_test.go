@@ -29,6 +29,7 @@ var existingServerFlagNames = []string{
 	"max-profiles",
 	"max-staged-games",
 	"public-host",
+	"public-relay-port",
 	"relay-bytes-per-second",
 	"relay-listen",
 	"relay-packets-per-second",
@@ -107,6 +108,7 @@ func TestRootCommandBindsAllFlags(t *testing.T) {
 		"--relay-listen", "127.0.0.1:31001",
 		"--health-listen=127.0.0.1:31002",
 		"--public-host", "relay.example.net",
+		"--public-relay-port", "32001",
 		"--data-file=/var/lib/generals/profiles.db",
 		"--tls-cert", "/run/tls/cert.pem",
 		"--tls-key=/run/tls/key.pem",
@@ -133,6 +135,7 @@ func TestRootCommandBindsAllFlags(t *testing.T) {
 	want.RelayAddr = "127.0.0.1:31001"
 	want.HealthAddr = "127.0.0.1:31002"
 	want.PublicHost = "relay.example.net"
+	want.PublicRelayPort = 32001
 	want.DataFile = "/var/lib/generals/profiles.db"
 	want.TLSCertFile = "/run/tls/cert.pem"
 	want.TLSKeyFile = "/run/tls/key.pem"
@@ -187,6 +190,7 @@ func TestLegacyLongFlagsReachConfig(t *testing.T) {
 	}
 	args := []string{
 		"-public-host", "legacy.example.net",
+		"-public-relay-port", "32002",
 		"-data-file=/tmp/legacy.db",
 		"-allow-insecure-password-auth=true",
 		"-max-profiles", "4321",
@@ -196,7 +200,7 @@ func TestLegacyLongFlagsReachConfig(t *testing.T) {
 	if code := execute(ctx, args, io.Discard, io.Discard, factory); code != 0 {
 		t.Fatalf("execute() = %d, want 0", code)
 	}
-	if got.PublicHost != "legacy.example.net" || got.DataFile != "/tmp/legacy.db" ||
+	if got.PublicHost != "legacy.example.net" || got.PublicRelayPort != 32002 || got.DataFile != "/tmp/legacy.db" ||
 		!got.AllowInsecurePasswordAuth || got.MaxProfiles != 4321 || got.GameIdleTimeout != 2*time.Minute {
 		t.Fatalf("legacy flags produced unexpected config: %#v", got)
 	}

@@ -16,8 +16,10 @@ The game command-line flag `-onlineServer <endpoint>` selects the control
 endpoint. `tls://host[:control-port]` requires verified TLS and enables
 persistent account authentication. A bare `host[:control-port]` is explicit
 plaintext guest mode for local development. The server advertises the public
-relay host and actual relay port in `game.started`; the client must not derive
-the relay endpoint from the control endpoint.
+relay host and UDP port in `game.started`; the client must not derive the relay
+endpoint from the control endpoint. The port is the bound relay port by
+default, or the explicit `--public-relay-port` value when an external
+NAT/firewall mapping differs.
 
 ## Control framing and envelopes
 
@@ -367,6 +369,12 @@ game and relay, releases all members, and emits `game.ended` with reason
 `host_ended`; it never reopens stale staging state. The immutable roster
 captured at `game.go` remains the authority for `stats.results`, so a host can
 still report a departed launch player as `disconnect`.
+
+When the relay receives no authenticated Bind, Keepalive, or Data traffic for
+`--game-idle-timeout` (15 minutes by default), it terminates the allocation and
+the matching control-plane game. Connected participants receive `game.ended`
+with reason `relay_idle_timeout`, and all participants are released to stage or
+join another game.
 
 Before relay allocation, a staged host departure dissolves the open lobby.
 Remaining members first receive a final `game.updated` without the host and

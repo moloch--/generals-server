@@ -133,6 +133,41 @@ func TestRelayBuffersInitialDatagramUntilRecipientBinds(t *testing.T) {
 	}
 }
 
+func TestRelayAdvertisesConfiguredPublicPort(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name       string
+		publicPort int
+	}{
+		{name: "bound port by default"},
+		{name: "explicit public port", publicPort: 42001},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.RelayAddr = "127.0.0.1:0"
+			cfg.PublicHost = "relay.test"
+			cfg.PublicRelayPort = test.publicPort
+			relay := NewRelay(cfg, slog.New(slog.NewTextHandler(testWriter{t}, nil)))
+			if err := relay.Start(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			defer relay.Close()
+
+			credentials, err := relay.Allocate(1, []Member{{UserID: 1, DisplayName: "Player", Slot: 0}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantPort := test.publicPort
+			if wantPort == 0 {
+				wantPort = relay.Port()
+			}
+			if got := credentials[1].Port; got != wantPort {
+				t.Fatalf("advertised relay port = %d, want %d", got, wantPort)
+			}
+		})
+	}
+}
+
 func listenTestUDP(t *testing.T) *net.UDPConn {
 	t.Helper()
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})

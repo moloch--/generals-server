@@ -60,3 +60,30 @@ func TestNewServerValidatesStartReadyTimeout(t *testing.T) {
 		}
 	}
 }
+
+func TestNewServerValidatesPublicRelayPort(t *testing.T) {
+	t.Parallel()
+
+	for _, port := range []int{0, 1, 27901, 65535} {
+		cfg := DefaultConfig()
+		cfg.DataFile = ""
+		cfg.PublicRelayPort = port
+		server, err := NewServer(cfg, nil)
+		if err != nil {
+			t.Errorf("valid public relay port %d was rejected: %v", port, err)
+			continue
+		}
+		if err := server.Shutdown(context.Background()); err != nil {
+			t.Errorf("close server for public relay port %d: %v", port, err)
+		}
+	}
+
+	for _, port := range []int{-1, 65536} {
+		cfg := DefaultConfig()
+		cfg.DataFile = ""
+		cfg.PublicRelayPort = port
+		if _, err := NewServer(cfg, nil); err == nil {
+			t.Errorf("invalid public relay port %d was accepted", port)
+		}
+	}
+}

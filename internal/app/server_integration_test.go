@@ -1229,6 +1229,81 @@ func TestStartReadyBarrierTimeoutDepartureAndGenerationGuard(t *testing.T) {
 	})
 }
 
+func TestRelayIdleExpiryDissolvesStartedGame(t *testing.T) {
+	cfg := hardeningTestConfig(t)
+	cfg.GameIdleTimeout = time.Minute
+	server, host, peer, gameIDText := startTwoPlayerCredentialPhase(t, cfg)
+	completeStartBarrier(t, gameIDText, host, peer)
+
+	gameID, err := parseGameID(gameIDText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.relay.mu.Lock()
+	server.relay.games[gameID].lastActivity = time.Now().Add(-2 * cfg.GameIdleTimeout)
+	server.relay.mu.Unlock()
+
+	expired := make(chan struct{})
+	go func() {
+		server.relay.expireIdleGames(time.Now())
+		close(expired)
+	}()
+	select {
+	case <-expired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("relay expiry deadlocked while coordinating Hub cleanup")
+	}
+
+	for _, client := range []*testPeer{host, peer} {
+		ended := client.requireEvent("game.ended")
+		var data struct {
+			GameID string `json:"game_id"`
+			Reason string `json:"reason"`
+		}
+		decodeWireData(t, ended, &data)
+		if data.GameID != gameIDText || data.Reason != "relay_idle_timeout" {
+			t.Fatalf("relay idle expiry event: %+v", data)
+		}
+	}
+	if server.relay.Stats().ActiveGames != 0 || server.hub.Stats().ActiveGames != 0 {
+		t.Fatal("relay idle expiry retained game state")
+	}
+	server.hub.mu.RLock()
+	remainingGames := len(server.hub.games)
+	remainingUserGames := len(server.hub.userGame)
+	statuses := make([]string, 0, len(server.hub.clients))
+	for _, client := range server.hub.clients {
+		statuses = append(statuses, client.status)
+	}
+	server.hub.mu.RUnlock()
+	if remainingGames != 0 || remainingUserGames != 0 {
+		t.Fatalf("relay idle expiry retained %d games and %d user-to-game mappings", remainingGames, remainingUserGames)
+	}
+	for _, status := range statuses {
+		if status != "online" {
+			t.Fatalf("relay idle expiry left participant status %q, want online", status)
+		}
+	}
+
+	replacement := host.command("game.create", testCompatibleRequest(map[string]any{
+		"name": "After Relay Expiry", "password": "", "max_players": 2, "options": map[string]any{},
+	}))
+	var replacementData struct {
+		Game GameSnapshot `json:"game"`
+	}
+	decodeWireData(t, replacement, &replacementData)
+	joined := peer.command("game.join", testCompatibleRequest(map[string]any{
+		"game_id": replacementData.Game.GameID, "password": "",
+	}))
+	var joinedData struct {
+		Game GameSnapshot `json:"game"`
+	}
+	decodeWireData(t, joined, &joinedData)
+	if len(joinedData.Game.Members) != 2 {
+		t.Fatalf("expired-game participants could not stage a replacement: %+v", joinedData.Game)
+	}
+}
+
 func TestHostDepartureDissolvesStagedGame(t *testing.T) {
 	cfg := hardeningTestConfig(t)
 	server := startHardeningTestServer(t, cfg)

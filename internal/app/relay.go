@@ -73,6 +73,7 @@ type Relay struct {
 	games        map[uint64]*relayGame
 	closing      bool
 	runtimeError func(error)
+	gameExpired  func(uint64)
 
 	datagramsIn       atomic.Uint64
 	datagramsOut      atomic.Uint64
@@ -87,6 +88,12 @@ type Relay struct {
 
 func NewRelay(cfg Config, logger *slog.Logger) *Relay {
 	return &Relay{cfg: cfg, log: logger, games: make(map[uint64]*relayGame)}
+}
+
+func (r *Relay) SetGameExpiredHandler(handler func(uint64)) {
+	r.mu.Lock()
+	r.gameExpired = handler
+	r.mu.Unlock()
 }
 
 func (r *Relay) Start(ctx context.Context) error {
@@ -164,6 +171,10 @@ func (r *Relay) Allocate(gameID uint64, members []Member) (map[uint64]RelayCrede
 		byToken:      make(map[relayToken]*relayParticipant, len(members)),
 		lastActivity: time.Now(),
 	}
+	publicPort := r.cfg.PublicRelayPort
+	if publicPort == 0 {
+		publicPort = r.conn.LocalAddr().(*net.UDPAddr).Port
+	}
 	credentials := make(map[uint64]RelayCredential, len(members))
 	for _, member := range members {
 		if member.Slot < 0 || member.Slot > 7 {
@@ -182,7 +193,7 @@ func (r *Relay) Allocate(gameID uint64, members []Member) (map[uint64]RelayCrede
 		credentials[member.UserID] = RelayCredential{
 			GameID:   formatGameID(gameID),
 			Host:     r.cfg.PublicHost,
-			Port:     r.conn.LocalAddr().(*net.UDPAddr).Port,
+			Port:     publicPort,
 			Slot:     member.Slot,
 			Token:    hex.EncodeToString(token[:]),
 			Peers:    append([]Member(nil), members...),
@@ -398,13 +409,28 @@ func (r *Relay) expireLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
-			r.mu.Lock()
-			for id, game := range r.games {
-				if now.Sub(game.lastActivity) > r.cfg.GameIdleTimeout {
-					delete(r.games, id)
-				}
-			}
-			r.mu.Unlock()
+			r.expireIdleGames(now)
+		}
+	}
+}
+
+func (r *Relay) expireIdleGames(now time.Time) {
+	r.mu.Lock()
+	expired := make([]uint64, 0)
+	for id, game := range r.games {
+		if now.Sub(game.lastActivity) > r.cfg.GameIdleTimeout {
+			delete(r.games, id)
+			expired = append(expired, id)
+		}
+	}
+	handler := r.gameExpired
+	r.mu.Unlock()
+
+	// Hub cleanup takes the Hub mutex and then calls back into EndGame. Run the
+	// callback only after releasing the relay mutex to preserve that lock order.
+	for _, gameID := range expired {
+		if handler != nil {
+			handler(gameID)
 		}
 	}
 }

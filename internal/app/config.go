@@ -12,6 +12,7 @@ type Config struct {
 	RelayAddr                 string
 	HealthAddr                string
 	PublicHost                string
+	PublicRelayPort           int
 	DataFile                  string
 	TLSCertFile               string
 	TLSKeyFile                string

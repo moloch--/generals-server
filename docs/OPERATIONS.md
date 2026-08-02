@@ -16,8 +16,18 @@ Set `--public-host` to a DNS name resolvable by every player. This value is sent
 in per-player `game.started` events. It may differ from the control listener's
 bind address, but it must be a bare ASCII DNS name or IPv4 address without a
 scheme, port, path, whitespace, or IPv6 syntax. Invalid values fail startup. If
-the relay uses a non-default external port, publish that port directly because
-the current server advertises its bound UDP port.
+the public UDP port differs from the port bound by `--relay-listen`, pass the
+external port with `--public-relay-port`. Its default value of zero advertises
+the bound UDP port, preserving direct-listener deployments.
+
+For example, when NAT forwards public UDP 32001 to local UDP 27901:
+
+```bash
+generals-server \
+  --relay-listen :27901 \
+  --public-host online.example.net \
+  --public-relay-port 32001
+```
 
 ## TLS
 
@@ -177,6 +187,13 @@ allocations expire after 15 minutes. Before launch, every participant has 15
 seconds by default to confirm that it parsed its relay credentials; configure
 this with `--start-ready-timeout`. A timeout deletes the pending game and relay
 instead of leaving a host stuck in `starting`.
+
+Relay idle expiry is terminal for the corresponding game. The server removes
+the control-plane game and every user-to-game mapping, restores connected
+participants to Online status, and sends `game.ended` with reason
+`relay_idle_timeout`. This cleanup is coordinated after releasing the relay
+lock so concurrent control commands and disconnects cannot invert Hub/relay
+lock ordering.
 
 The default control-plane ceilings are 256 total TCP/TLS sockets, 128
 authenticated players, 10,000 persistent profiles, and 64 staged or active

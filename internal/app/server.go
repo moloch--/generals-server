@@ -38,6 +38,9 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 	if err := validatePublicHost(cfg.PublicHost); err != nil {
 		return nil, fmt.Errorf("invalid public host: %w", err)
 	}
+	if cfg.PublicRelayPort < 0 || cfg.PublicRelayPort > 65535 {
+		return nil, errors.New("public relay port must be zero or a valid UDP port")
+	}
 	if cfg.MaxControlLineBytes < 1024 {
 		return nil, errors.New("max control message must be at least 1024 bytes")
 	}
@@ -66,6 +69,7 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 	}
 	relay := NewRelay(cfg, logger)
 	hub := NewHub(cfg, logger, store, relay)
+	relay.SetGameExpiredHandler(hub.handleRelayGameExpired)
 	control := NewControlServer(cfg, logger, store, hub)
 	return &Server{
 		cfg: cfg, log: logger, store: store, relay: relay, hub: hub, control: control,

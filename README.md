@@ -68,10 +68,14 @@ Configure the public DNS name separately, then advertise it to clients:
 
 `--public-host` accepts a bare ASCII DNS name or IPv4 address only. Do not add a
 scheme, port, path, whitespace, or IPv6 literal; invalid values fail startup.
+By default, relay credentials advertise the UDP port bound by `--relay-listen`.
+If a firewall or NAT maps a different external UDP port, set that value with
+`--public-relay-port`; zero keeps the bound-port default.
 
-Allow inbound TCP 29900 and UDP 27901. Firewall HTTP 8080 from the public
-Internet or bind it to a private monitoring interface. The control protocol supports native TLS; do
-not enable insecure password auth on an Internet-facing plaintext listener.
+Allow inbound TCP 29900 and the advertised UDP relay port (27901 by default).
+Firewall HTTP 8080 from the public Internet or bind it to a private monitoring
+interface. The control protocol supports native TLS; do not enable insecure
+password auth on an Internet-facing plaintext listener.
 
 Players connect with certificate and hostname verification enabled:
 
@@ -123,4 +127,7 @@ traffic.
 - A departed custom-game participant's relay token and endpoint are removed
   without interrupting post-`game.go` survivor traffic. Explicit `game.end`
   releases the retained game and relay.
+- An idle relay allocation expires after 15 minutes by default. Expiry also
+  releases the corresponding control-plane game state and notifies remaining
+  participants with `game.ended`.
 - Relay tokens authenticate routing; they do not encrypt game packets.
