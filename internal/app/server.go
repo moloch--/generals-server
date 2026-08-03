@@ -24,6 +24,7 @@ type Server struct {
 	healthLn     net.Listener
 	admin        *http.Server
 	adminLn      net.Listener
+	adminHandler *adminHandler
 	adminToken   adminTokenHash
 	cancel       context.CancelFunc
 	errors       chan error
@@ -160,8 +161,10 @@ func (s *Server) Start(parent context.Context) error {
 	startedAt := time.Now().UTC()
 	if adminListener != nil {
 		s.adminLn = adminListener
+		// GeneralsX @feature OpenAI 02/08/2026 Own realtime admin connections so shutdown closes every hijacked socket.
+		s.adminHandler = newAdminHandler(s.adminToken, s.store, s.hub, s.relay, s.log, startedAt)
 		s.admin = &http.Server{
-			Handler:           newAdminHandler(s.adminToken, s.store, s.hub, s.relay, s.log, startedAt),
+			Handler:           s.adminHandler,
 			ReadHeaderTimeout: 5 * time.Second,
 			ReadTimeout:       10 * time.Second,
 			WriteTimeout:      10 * time.Second,
@@ -210,11 +213,15 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	health := s.health
 	admin := s.admin
+	adminHandler := s.adminHandler
 	s.mu.Unlock()
 
 	var errs []error
 	if wasStarted {
 		if admin != nil {
+			if err := adminHandler.shutdownEvents(ctx); err != nil {
+				errs = append(errs, err)
+			}
 			if err := admin.Shutdown(ctx); err != nil {
 				errs = append(errs, err)
 				_ = admin.Close()

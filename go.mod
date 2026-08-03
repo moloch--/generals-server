@@ -3,6 +3,7 @@ module github.com/moloch--/generals-server
 go 1.26
 
 require (
+	github.com/coder/websocket v1.8.15
 	github.com/spf13/cobra v1.10.2
 	modernc.org/sqlite v1.55.0
 )

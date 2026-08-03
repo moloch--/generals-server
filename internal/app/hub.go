@@ -2,6 +2,7 @@ package app
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -81,7 +82,10 @@ type Hub struct {
 	displayOwners        map[string]uint64
 	pendingAdmissions    map[uint64]string
 	pendingRegistrations map[string]struct{}
+	commandGate          sync.RWMutex
 }
+
+var errAuthenticationCredentialsChanged = errors.New("profile credentials changed while authenticating")
 
 func NewHub(cfg Config, logger *slog.Logger, store *ProfileStore, relay *Relay) *Hub {
 	rooms := map[string]*chatRoom{
@@ -103,6 +107,32 @@ func NewHub(cfg Config, logger *slog.Logger, store *ProfileStore, relay *Relay) 
 func (h *Hub) ReserveProfile(profile Profile) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	return h.reserveProfileLocked(profile)
+}
+
+// GeneralsX @bugfix OpenAI 02/08/2026 Reject credentials changed while authentication is in flight.
+// AuthenticateAndReserve rejects an authentication result if an administrator
+// changed credentials while the password derivation was in flight. The costly
+// password check remains outside the hub lock so login attempts cannot stall
+// unrelated live game traffic.
+func (h *Hub) AuthenticateAndReserve(username, password string) (Profile, error) {
+	profile, stamp, err := h.store.authenticateWithCredentialStamp(username, password)
+	if err != nil {
+		return Profile{}, err
+	}
+	return profile, h.reserveAuthenticatedProfile(profile, stamp)
+}
+
+func (h *Hub) reserveAuthenticatedProfile(profile Profile, stamp credentialStamp) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	current, exists, err := h.store.currentCredentialStamp(profile.UserID)
+	if err != nil {
+		return err
+	}
+	if !exists || subtle.ConstantTimeCompare(current[:], stamp[:]) != 1 {
+		return errAuthenticationCredentialsChanged
+	}
 	return h.reserveProfileLocked(profile)
 }
 
@@ -161,13 +191,26 @@ func (h *Hub) ReserveRegistration(displayName string) error {
 	return nil
 }
 
-func (h *Hub) CommitRegistration(profile Profile) {
+// GeneralsX @bugfix OpenAI 02/08/2026 Verify the registered credential before admitting its connection.
+func (h *Hub) CommitRegistration(profile Profile, stamp credentialStamp) error {
 	key := normalizeDisplayName(profile.DisplayName)
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	delete(h.pendingRegistrations, key)
+	current, exists, err := h.store.currentCredentialStamp(profile.UserID)
+	if err != nil {
+		return err
+	}
+	if !exists || subtle.ConstantTimeCompare(current[:], stamp[:]) != 1 {
+		return errAuthenticationCredentialsChanged
+	}
+	stored, exists := h.store.Get(profile.UserID)
+	if !exists || stored.Username != profile.Username || stored.DisplayName != profile.DisplayName {
+		return errors.New("registered profile changed before admission")
+	}
 	h.displayOwners[key] = profile.UserID
 	h.pendingAdmissions[profile.UserID] = key
-	h.mu.Unlock()
+	return nil
 }
 
 func (h *Hub) ReleaseRegistration(displayName string) {
@@ -220,6 +263,10 @@ func (h *Hub) IssueSession(profile Profile) (string, time.Time, error) {
 	token := base64.RawURLEncoding.EncodeToString(tokenBytes[:])
 	expires := time.Now().Add(h.cfg.SessionTTL)
 	h.mu.Lock()
+	if h.pendingAdmissions[profile.UserID] != normalizeDisplayName(profile.DisplayName) {
+		h.mu.Unlock()
+		return "", time.Time{}, errors.New("profile admission was revoked")
+	}
 	h.pruneSessionsLocked(time.Now())
 	if previous := h.sessionByUser[profile.UserID]; previous != "" {
 		delete(h.sessions, previous)
@@ -230,6 +277,7 @@ func (h *Hub) IssueSession(profile Profile) (string, time.Time, error) {
 	return token, expires, nil
 }
 
+// GeneralsX @bugfix OpenAI 02/08/2026 Reject resumable sessions after their persistent profile is deleted.
 func (h *Hub) ResumeAndReserve(token string) (Profile, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -240,9 +288,15 @@ func (h *Hub) ResumeAndReserve(token string) (Profile, error) {
 		return Profile{}, errors.New("session token is invalid or expired")
 	}
 	if !session.profile.Guest {
-		if profile, exists := h.store.Get(session.profile.UserID); exists {
-			session.profile = profile
+		profile, exists := h.store.Get(session.profile.UserID)
+		if !exists {
+			delete(h.sessions, token)
+			if h.sessionByUser[session.profile.UserID] == token {
+				delete(h.sessionByUser, session.profile.UserID)
+			}
+			return Profile{}, errors.New("session token is invalid or expired")
 		}
+		session.profile = profile
 	}
 	if err := h.reserveProfileLocked(session.profile); err != nil {
 		return Profile{}, err
@@ -254,8 +308,16 @@ func (h *Hub) ResumeAndReserve(token string) (Profile, error) {
 	return session.profile, nil
 }
 
-func (h *Hub) Connect(client *controlClient) {
+func (h *Hub) Connect(client *controlClient) (map[string]any, error) {
+	h.commandGate.Lock()
+	defer h.commandGate.Unlock()
 	h.mu.Lock()
+	key := normalizeDisplayName(client.profile.DisplayName)
+	if h.pendingAdmissions[client.profile.UserID] != key {
+		h.revokeProfileSessionsLocked(client.profile.UserID)
+		h.mu.Unlock()
+		return nil, errors.New("profile admission was revoked")
+	}
 	delete(h.pendingAdmissions, client.profile.UserID)
 	if previous := h.clients[client.profile.UserID]; previous != nil && previous != client {
 		previous.event("session.replaced", map[string]any{"reason": "a newer connection authenticated"})
@@ -282,7 +344,7 @@ func (h *Hub) Connect(client *controlClient) {
 	room := h.roomSnapshotLocked(roomID)
 	games := h.gameListLocked()
 	h.mu.Unlock()
-	client.event("session.ready", map[string]any{"room": room, "games": games, "current_game": currentGame})
+	return map[string]any{"room": room, "games": games, "current_game": currentGame}, nil
 }
 
 func (h *Hub) Disconnect(client *controlClient) {
@@ -303,7 +365,16 @@ func (h *Hub) disconnectLocked(client *controlClient) {
 	h.notifyBuddyStatusLocked(client.profile.UserID, false, "offline")
 }
 
+// GeneralsX @bugfix OpenAI 02/08/2026 Serialize authenticated commands against administrative revocation.
 func (h *Hub) Command(client *controlClient, command string, raw json.RawMessage) (any, bool, error) {
+	h.commandGate.RLock()
+	defer h.commandGate.RUnlock()
+	h.mu.RLock()
+	active := h.clients[client.profile.UserID] == client
+	h.mu.RUnlock()
+	if !active {
+		return nil, false, commandErr("session_closed", "the authenticated session is no longer active")
+	}
 	switch command {
 	case "ping":
 		return map[string]any{"type": "pong", "server_time": time.Now().UTC().Format(time.RFC3339Nano)}, false, nil
@@ -469,6 +540,8 @@ func (h *Hub) AdminSnapshot() adminHubSnapshot {
 }
 
 func (h *Hub) AdminDisconnect(userID uint64) bool {
+	h.commandGate.Lock()
+	defer h.commandGate.Unlock()
 	h.mu.Lock()
 	client := h.clients[userID]
 	if client != nil {
@@ -483,7 +556,73 @@ func (h *Hub) AdminDisconnect(userID uint64) bool {
 	return true
 }
 
+// GeneralsX @feature OpenAI 02/08/2026 Revoke every live and resumable access path during profile management.
+func (h *Hub) AdminResetPassword(userID uint64, password string) (bool, error) {
+	h.commandGate.Lock()
+	defer h.commandGate.Unlock()
+	h.mu.Lock()
+	updated, err := h.store.ResetPassword(userID, password)
+	if err != nil || !updated {
+		h.mu.Unlock()
+		return updated, err
+	}
+	client := h.revokeProfileAccessLocked(userID)
+	h.mu.Unlock()
+	closeAdminRevokedClient(client, "password_reset_by_admin")
+	return true, nil
+}
+
+func (h *Hub) AdminDeleteProfile(userID uint64) (bool, error) {
+	h.commandGate.Lock()
+	defer h.commandGate.Unlock()
+	h.mu.Lock()
+	deleted, err := h.store.DeleteProfile(userID)
+	if err != nil || !deleted {
+		h.mu.Unlock()
+		return deleted, err
+	}
+	client := h.revokeProfileAccessLocked(userID)
+	h.mu.Unlock()
+	closeAdminRevokedClient(client, "profile_deleted_by_admin")
+	return true, nil
+}
+
+func (h *Hub) revokeProfileAccessLocked(userID uint64) *controlClient {
+	h.revokeProfileSessionsLocked(userID)
+
+	client := h.clients[userID]
+	if client != nil {
+		h.disconnectLocked(client)
+	}
+	if key, reserved := h.pendingAdmissions[userID]; reserved {
+		delete(h.pendingAdmissions, userID)
+		if h.displayOwners[key] == userID {
+			delete(h.displayOwners, key)
+		}
+	}
+	return client
+}
+
+func (h *Hub) revokeProfileSessionsLocked(userID uint64) {
+	for token, session := range h.sessions {
+		if session.profile.UserID == userID {
+			delete(h.sessions, token)
+		}
+	}
+	delete(h.sessionByUser, userID)
+}
+
+func closeAdminRevokedClient(client *controlClient, reason string) {
+	if client == nil {
+		return
+	}
+	client.event("session.closed", map[string]any{"reason": reason})
+	client.close()
+}
+
 func (h *Hub) AdminCloseGame(gameID uint64) bool {
+	h.commandGate.Lock()
+	defer h.commandGate.Unlock()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	game := h.games[gameID]

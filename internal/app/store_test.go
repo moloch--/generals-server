@@ -163,6 +163,145 @@ func TestProfileStorePersistsAuthBuddiesAndStats(t *testing.T) {
 	}
 }
 
+func TestProfileStoreVisibleRevisionTracksCommittedProfileMutations(t *testing.T) {
+	store := openTestProfileStore(t, "")
+	if got := store.VisibleRevision(); got != 0 {
+		t.Fatalf("initial visible revision = %d, want 0", got)
+	}
+
+	profile, err := store.Register("revision_user", "original password", "Revision User")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertVisibleRevision(t, store, 1)
+	originalStamp, exists, err := store.currentCredentialStamp(profile.UserID)
+	if err != nil || !exists {
+		t.Fatalf("read original credential stamp exists=%v error=%v", exists, err)
+	}
+
+	if _, err := store.Register("bad", "short", "Bad Password"); err == nil {
+		t.Fatal("invalid registration password was accepted")
+	}
+	assertVisibleRevision(t, store, 1)
+
+	if _, err := store.ApplyStatsBatch(map[uint64]PlayerStats{999999: {Wins: 1}}); err == nil {
+		t.Fatal("stats update for an unknown profile succeeded")
+	}
+	assertVisibleRevision(t, store, 1)
+
+	if _, err := store.ApplyStats(profile.UserID, PlayerStats{Wins: 1, Games: 1}); err != nil {
+		t.Fatal(err)
+	}
+	assertVisibleRevision(t, store, 2)
+
+	if _, err := store.UpdateDisplayName(profile.UserID, "Revision Prime"); err != nil {
+		t.Fatal(err)
+	}
+	assertVisibleRevision(t, store, 3)
+	nonAuthStamp, exists, err := store.currentCredentialStamp(profile.UserID)
+	if err != nil || !exists || nonAuthStamp != originalStamp {
+		t.Fatalf("non-auth mutations changed credential stamp exists=%v error=%v", exists, err)
+	}
+
+	if updated, err := store.ResetPassword(profile.UserID, "new secure password"); err != nil || !updated {
+		t.Fatalf("ResetPassword() updated=%v error=%v", updated, err)
+	}
+	assertVisibleRevision(t, store, 4)
+	resetStamp, exists, err := store.currentCredentialStamp(profile.UserID)
+	if err != nil || !exists || resetStamp == originalStamp {
+		t.Fatalf("password reset credential stamp exists=%v changed=%v error=%v", exists, resetStamp != originalStamp, err)
+	}
+
+	if updated, err := store.ResetPassword(999999, "another secure password"); err != nil || updated {
+		t.Fatalf("missing ResetPassword() updated=%v error=%v", updated, err)
+	}
+	if _, err := store.ResetPassword(profile.UserID, "short"); err == nil {
+		t.Fatal("invalid reset password was accepted")
+	}
+	assertVisibleRevision(t, store, 4)
+
+	if deleted, err := store.DeleteProfile(999999); err != nil || deleted {
+		t.Fatalf("missing DeleteProfile() deleted=%v error=%v", deleted, err)
+	}
+	assertVisibleRevision(t, store, 4)
+	if deleted, err := store.DeleteProfile(profile.UserID); err != nil || !deleted {
+		t.Fatalf("DeleteProfile() deleted=%v error=%v", deleted, err)
+	}
+	assertVisibleRevision(t, store, 5)
+	if _, exists, err := store.currentCredentialStamp(profile.UserID); err != nil || exists {
+		t.Fatalf("deleted credential stamp exists=%v error=%v", exists, err)
+	}
+}
+
+func TestProfileStoreResetPasswordAndDeleteProfilePersist(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "profiles.db")
+	store := openTestProfileStore(t, path)
+	alice, err := store.Register("admin_alice", "original password", "Admin Alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := store.Register("admin_bob", "bob password", "Admin Bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	charlie, err := store.Register("admin_charlie", "charlie password", "Admin Charlie")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RequestBuddy(alice.UserID, bob.UserID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AcceptBuddy(bob.UserID, alice.UserID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RequestBuddy(charlie.UserID, alice.UserID); err != nil {
+		t.Fatal(err)
+	}
+
+	if updated, err := store.ResetPassword(alice.UserID, "replacement password"); err != nil || !updated {
+		t.Fatalf("ResetPassword() updated=%v error=%v", updated, err)
+	}
+	if _, err := store.Authenticate("admin_alice", "original password"); err == nil {
+		t.Fatal("original password remained valid after reset")
+	}
+	if _, err := store.Authenticate("admin_alice", "replacement password"); err != nil {
+		t.Fatalf("replacement password was rejected: %v", err)
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened := openTestProfileStore(t, path)
+	if _, err := reopened.Authenticate("admin_alice", "replacement password"); err != nil {
+		t.Fatalf("replacement password did not persist: %v", err)
+	}
+	if deleted, err := reopened.DeleteProfile(alice.UserID); err != nil || !deleted {
+		t.Fatalf("DeleteProfile() deleted=%v error=%v", deleted, err)
+	}
+	if _, ok := reopened.Get(alice.UserID); ok {
+		t.Fatal("deleted profile remained readable")
+	}
+	if _, err := reopened.Authenticate("admin_alice", "replacement password"); err == nil {
+		t.Fatal("deleted profile still authenticated")
+	}
+	if buddies, pending, ok := reopened.BuddyIDs(bob.UserID); !ok || len(buddies) != 0 || len(pending) != 0 {
+		t.Fatalf("buddy cascade state = buddies %v pending %v ok %v", buddies, pending, ok)
+	}
+	var buddyRows, requestRows int
+	if err := reopened.db.QueryRow(`SELECT COUNT(*) FROM buddies`).Scan(&buddyRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.db.QueryRow(`SELECT COUNT(*) FROM buddy_requests`).Scan(&requestRows); err != nil {
+		t.Fatal(err)
+	}
+	if buddyRows != 0 || requestRows != 0 {
+		t.Fatalf("profile deletion left buddy rows=%d request rows=%d", buddyRows, requestRows)
+	}
+	if deleted, err := reopened.DeleteProfile(alice.UserID); err != nil || deleted {
+		t.Fatalf("second DeleteProfile() deleted=%v error=%v", deleted, err)
+	}
+}
+
 func TestProfileStoreApplyStatsBatchIsAtomic(t *testing.T) {
 	store := openTestProfileStore(t, "")
 	alice, err := store.Register("batch_alice", "correct horse", "Batch Alice")
@@ -479,6 +618,13 @@ func assertStats(t *testing.T, store *ProfileStore, id uint64, want PlayerStats)
 	got, ok := store.Stats(id)
 	if !ok || got != want {
 		t.Fatalf("stats for %d = %+v ok=%v, want %+v", id, got, ok, want)
+	}
+}
+
+func assertVisibleRevision(t *testing.T, store *ProfileStore, want uint64) {
+	t.Helper()
+	if got := store.VisibleRevision(); got != want {
+		t.Fatalf("visible revision = %d, want %d", got, want)
 	}
 }
 

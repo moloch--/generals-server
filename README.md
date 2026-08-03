@@ -14,7 +14,8 @@ The server provides:
 - basic two-player quickmatch keyed by mode and the exact compatibility tuple;
 - a token-authenticated, slot-aware UDP relay for opaque game traffic;
 - JSON health output and Prometheus metrics;
-- a bearer-authenticated REST API and embedded HeroUI Pro admin dashboard.
+- a bearer-authenticated REST API and embedded HeroUI Pro admin dashboard with
+  profile management and near-realtime WebSocket updates.
 
 The exact client contract is [docs/PROTOCOL.md](docs/PROTOCOL.md).
 Production and service-manager guidance is in

@@ -375,12 +375,13 @@ func (s *ControlServer) dispatchAuth(client *controlClient, message inboundEnvel
 		}
 		if err = decodeData(message.Data, &request); err == nil {
 			if err = s.hub.ReserveRegistration(request.DisplayName); err == nil {
-				profile, err = s.store.Register(request.Username, request.Password, request.DisplayName)
+				var stamp credentialStamp
+				profile, stamp, err = s.store.registerWithCredentialStamp(request.Username, request.Password, request.DisplayName)
 				if err != nil {
 					s.hub.ReleaseRegistration(request.DisplayName)
 				} else {
-					s.hub.CommitRegistration(profile)
-					profileReserved = true
+					err = s.hub.CommitRegistration(profile, stamp)
+					profileReserved = err == nil
 				}
 			}
 		}
@@ -393,7 +394,9 @@ func (s *ControlServer) dispatchAuth(client *controlClient, message inboundEnvel
 			Password string `json:"password"`
 		}
 		if err = decodeData(message.Data, &request); err == nil {
-			profile, err = s.store.Authenticate(request.Username, request.Password)
+			// GeneralsX @bugfix OpenAI 02/08/2026 Make credential verification and admission coherent with admin resets and deletes.
+			profile, err = s.hub.AuthenticateAndReserve(request.Username, request.Password)
+			profileReserved = err == nil
 		}
 	case "auth.resume":
 		if !s.passwordAuthAllowed(client) {
@@ -437,8 +440,15 @@ func (s *ControlServer) dispatchAuth(client *controlClient, message inboundEnvel
 		authData["token"] = token
 		authData["expires_at"] = expires.UTC().Format(time.RFC3339Nano)
 	}
+	// GeneralsX @bugfix OpenAI 02/08/2026 Revalidate admission before completing authentication after an admin revocation.
+	ready, connectErr := s.hub.Connect(client)
+	if connectErr != nil {
+		client.authed = false
+		s.hub.ReleaseProfileReservation(profile)
+		return commandErr("authentication_failed", connectErr.Error())
+	}
 	client.respond(message.RequestID, authData)
-	s.hub.Connect(client)
+	client.event("session.ready", ready)
 	return nil
 }
 

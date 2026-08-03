@@ -24,6 +24,7 @@ import {
   faSatelliteDish,
   faShieldHalved,
   faTowerBroadcast,
+  faTrashCan,
   faTriangleExclamation,
   faUserSlash,
   faUsers,
@@ -35,8 +36,10 @@ import {AlertDialog} from "@heroui/react/alert-dialog";
 import {Button} from "@heroui/react/button";
 import {Card} from "@heroui/react/card";
 import {Chip} from "@heroui/react/chip";
+import {FieldError} from "@heroui/react/field-error";
 import {Input} from "@heroui/react/input";
 import {Label} from "@heroui/react/label";
+import {Modal} from "@heroui/react/modal";
 import {SearchField} from "@heroui/react/search-field";
 import {TextField} from "@heroui/react/textfield";
 import {FormEvent, useCallback, useEffect, useMemo, useState} from "react";
@@ -49,6 +52,7 @@ import {
   type Profile,
   type ProfilePage,
   type Session,
+  type SnapshotEvent,
 } from "./api";
 
 const tokenStorageKey = "generals-server-admin-token";
@@ -59,6 +63,21 @@ interface DashboardState {
   overview: Overview;
   sessions: Session[];
   games: Game[];
+}
+
+type LiveStatus = "connecting" | "live" | "reconnecting";
+
+function isSnapshotEvent(value: unknown): value is SnapshotEvent {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const candidate = value as Partial<SnapshotEvent>;
+  return candidate.type === "snapshot"
+    && typeof candidate.sequence === "string"
+    && typeof candidate.profile_revision === "string"
+    && Boolean(candidate.overview && typeof candidate.overview === "object")
+    && Array.isArray(candidate.sessions)
+    && Array.isArray(candidate.games);
 }
 
 function formatInteger(value: string | number): string {
@@ -172,12 +191,10 @@ function ConfirmAction({
 }) {
   return (
     <AlertDialog>
-      <AlertDialog.Trigger>
-        <Button size="sm" variant="danger-soft">
-          <FontAwesomeIcon aria-hidden="true" icon={actionIcon} />
-          {actionLabel}
-        </Button>
-      </AlertDialog.Trigger>
+      <Button size="sm" variant="danger-soft">
+        <FontAwesomeIcon aria-hidden="true" icon={actionIcon} />
+        {actionLabel}
+      </Button>
       <AlertDialog.Backdrop>
         <AlertDialog.Container>
           <AlertDialog.Dialog>
@@ -197,6 +214,145 @@ function ConfirmAction({
         </AlertDialog.Container>
       </AlertDialog.Backdrop>
     </AlertDialog>
+  );
+}
+
+// GeneralsX @feature OpenAI 02/08/2026 Add accessible profile reset and deletion controls to the admin table.
+function ResetPasswordAction({
+  onReset,
+  profile,
+}: {
+  onReset: (password: string) => Promise<void>;
+  profile: Profile;
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [password, setPassword] = useState("");
+  const [confirmation, setConfirmation] = useState("");
+  const [wasSubmitted, setWasSubmitted] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [requestError, setRequestError] = useState("");
+  const formID = `reset-password-${profile.user_id}`;
+  const passwordBytes = new TextEncoder().encode(password).length;
+  const passwordError = wasSubmitted && (passwordBytes < 8 || passwordBytes > 128)
+    ? "Password must be 8–128 bytes."
+    : "";
+  const confirmationError = wasSubmitted && password !== confirmation
+    ? "Passwords do not match."
+    : "";
+
+  const clearForm = useCallback(() => {
+    setPassword("");
+    setConfirmation("");
+    setWasSubmitted(false);
+    setRequestError("");
+  }, []);
+
+  const handleOpenChange = useCallback(
+    (open: boolean) => {
+      setIsOpen(open);
+      if (!open) {
+        clearForm();
+      }
+    },
+    [clearForm],
+  );
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setWasSubmitted(true);
+    setRequestError("");
+    if (passwordBytes < 8 || passwordBytes > 128 || password !== confirmation) {
+      return;
+    }
+    setIsSubmitting(true);
+    try {
+      await onReset(password);
+      handleOpenChange(false);
+    } catch (caught) {
+      setRequestError(caught instanceof Error ? caught.message : "The password could not be reset.");
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  return (
+    <>
+      <Button size="sm" variant="secondary" onPress={() => setIsOpen(true)}>
+        <FontAwesomeIcon aria-hidden="true" icon={faKey} />
+        Reset password
+      </Button>
+      <Modal.Backdrop
+        isDismissable={!isSubmitting}
+        isKeyboardDismissDisabled={isSubmitting}
+        isOpen={isOpen}
+        onOpenChange={handleOpenChange}
+      >
+        <Modal.Container>
+          <Modal.Dialog className="sm:max-w-md">
+            <Modal.CloseTrigger isDisabled={isSubmitting} />
+            <Modal.Header>
+              <Modal.Icon className="bg-accent-soft text-accent-soft-foreground">
+                <FontAwesomeIcon aria-hidden="true" icon={faKey} />
+              </Modal.Icon>
+              <Modal.Heading>Reset password</Modal.Heading>
+              <p className="mt-1.5 text-sm leading-5 text-muted">
+                Set a new password for {profile.display_name}. Their active session and saved login will be revoked.
+              </p>
+            </Modal.Header>
+            <Modal.Body>
+              <form className="space-y-4" id={formID} onSubmit={submit}>
+                {requestError ? <ErrorAlert message={requestError} /> : null}
+                <TextField
+                  fullWidth
+                  isDisabled={isSubmitting}
+                  isInvalid={Boolean(passwordError)}
+                  isRequired
+                  name="new-password"
+                >
+                  <Label>New password</Label>
+                  <Input
+                    autoComplete="new-password"
+                    autoFocus
+                    placeholder="8–128 bytes"
+                    type="password"
+                    value={password}
+                    variant="secondary"
+                    onChange={(event) => setPassword(event.currentTarget.value)}
+                  />
+                  {passwordError ? <FieldError>{passwordError}</FieldError> : null}
+                </TextField>
+                <TextField
+                  fullWidth
+                  isDisabled={isSubmitting}
+                  isInvalid={Boolean(confirmationError)}
+                  isRequired
+                  name="confirm-password"
+                >
+                  <Label>Confirm new password</Label>
+                  <Input
+                    autoComplete="new-password"
+                    placeholder="Enter it again"
+                    type="password"
+                    value={confirmation}
+                    variant="secondary"
+                    onChange={(event) => setConfirmation(event.currentTarget.value)}
+                  />
+                  {confirmationError ? <FieldError>{confirmationError}</FieldError> : null}
+                </TextField>
+              </form>
+            </Modal.Body>
+            <Modal.Footer>
+              <Button isDisabled={isSubmitting} variant="secondary" onPress={() => handleOpenChange(false)}>
+                Cancel
+              </Button>
+              <Button form={formID} isPending={isSubmitting} type="submit">
+                Reset password
+              </Button>
+            </Modal.Footer>
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
+    </>
   );
 }
 
@@ -311,11 +467,14 @@ function Dashboard({token, onUnauthorized}: {token: string; onUnauthorized: () =
   const api = useMemo(() => new AdminApi(token), [token]);
   const [dashboard, setDashboard] = useState<DashboardState | null>(null);
   const [profilePage, setProfilePage] = useState<ProfilePage | null>(null);
+  const [profileRevision, setProfileRevision] = useState<string | null>(null);
+  const [profileRefreshKey, setProfileRefreshKey] = useState(0);
   const [queryInput, setQueryInput] = useState("");
   const [query, setQuery] = useState("");
   const [offset, setOffset] = useState(0);
   const [error, setError] = useState("");
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [liveStatus, setLiveStatus] = useState<LiveStatus>("connecting");
 
   const handleError = useCallback(
     (caught: unknown) => {
@@ -351,15 +510,117 @@ function Dashboard({token, onUnauthorized}: {token: string; onUnauthorized: () =
     [api, handleError],
   );
 
+  const refreshAll = useCallback(async () => {
+    setProfileRefreshKey((value) => value + 1);
+    await loadDashboard();
+  }, [loadDashboard]);
+
+  // GeneralsX @feature OpenAI 02/08/2026 Prefer pushed server snapshots with bounded reconnect and REST fallback.
   useEffect(() => {
     const controller = new AbortController();
     void loadDashboard(controller.signal);
-    const timer = window.setInterval(() => void loadDashboard(), 15_000);
-    return () => {
-      controller.abort();
-      window.clearInterval(timer);
-    };
+    return () => controller.abort();
   }, [loadDashboard]);
+
+  useEffect(() => {
+    if (liveStatus === "live") {
+      return;
+    }
+    const timer = window.setInterval(() => void refreshAll(), 15_000);
+    return () => window.clearInterval(timer);
+  }, [liveStatus, refreshAll]);
+
+  useEffect(() => {
+    let disposed = false;
+    let socket: WebSocket | null = null;
+    let retryTimer: number | undefined;
+    let ticketController: AbortController | null = null;
+    let retryAttempt = 0;
+    let hasConnected = false;
+
+    function scheduleReconnect() {
+      if (disposed) {
+        return;
+      }
+      setLiveStatus(hasConnected ? "reconnecting" : "connecting");
+      const delay = Math.min(1_000 * (2 ** retryAttempt), 30_000);
+      retryAttempt = Math.min(retryAttempt + 1, 5);
+      retryTimer = window.setTimeout(() => void connect(), delay);
+    }
+
+    async function connect() {
+      if (disposed) {
+        return;
+      }
+      setLiveStatus(hasConnected || retryAttempt > 0 ? "reconnecting" : "connecting");
+      ticketController = new AbortController();
+      try {
+        const ticket = await api.eventTicket(ticketController.signal);
+        if (disposed) {
+          return;
+        }
+        const url = new URL("/api/admin/v1/events", window.location.href);
+        url.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        url.searchParams.set("ticket", ticket.ticket);
+
+        const nextSocket = new WebSocket(url);
+        socket = nextSocket;
+        nextSocket.addEventListener("open", () => {
+          hasConnected = true;
+          retryAttempt = 0;
+          setLiveStatus("live");
+        });
+        nextSocket.addEventListener("message", (event) => {
+          if (typeof event.data !== "string") {
+            nextSocket.close(1002, "snapshot must be text");
+            return;
+          }
+          try {
+            const message: unknown = JSON.parse(event.data);
+            if (!isSnapshotEvent(message)) {
+              nextSocket.close(1002, "invalid snapshot");
+              return;
+            }
+            setDashboard({overview: message.overview, sessions: message.sessions, games: message.games});
+            setProfileRevision(message.profile_revision);
+            setError("");
+          } catch {
+            nextSocket.close(1002, "invalid snapshot");
+          }
+        });
+        nextSocket.addEventListener("error", () => {
+          if (nextSocket.readyState < WebSocket.CLOSING) {
+            nextSocket.close();
+          }
+        });
+        nextSocket.addEventListener("close", () => {
+          if (socket === nextSocket) {
+            socket = null;
+          }
+          scheduleReconnect();
+        });
+      } catch (caught) {
+        if (disposed || (caught instanceof DOMException && caught.name === "AbortError")) {
+          return;
+        }
+        if (caught instanceof ApiError && caught.status === 401) {
+          onUnauthorized();
+          return;
+        }
+        scheduleReconnect();
+      }
+    }
+
+    void connect();
+    return () => {
+      disposed = true;
+      ticketController?.abort();
+      if (retryTimer !== undefined) {
+        window.clearTimeout(retryTimer);
+      }
+      socket?.close(1000, "dashboard closed");
+    };
+  }, [api, onUnauthorized]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -379,18 +640,50 @@ function Dashboard({token, onUnauthorized}: {token: string; onUnauthorized: () =
       })
       .catch(handleError);
     return () => controller.abort();
-  }, [api, handleError, offset, query]);
+  }, [api, handleError, offset, profileRefreshKey, profileRevision, query]);
 
   const runAction = useCallback(
     async (action: () => Promise<void>) => {
       try {
         await action();
+        await refreshAll();
+      } catch (caught) {
+        handleError(caught);
+      }
+    },
+    [handleError, refreshAll],
+  );
+
+  const resetProfilePassword = useCallback(
+    async (profile: Profile, password: string) => {
+      try {
+        await api.resetPassword(profile.user_id, password);
+        await refreshAll();
+      } catch (caught) {
+        if (caught instanceof ApiError && caught.status === 401) {
+          handleError(caught);
+        }
+        throw caught;
+      }
+    },
+    [api, handleError, refreshAll],
+  );
+
+  const deleteProfile = useCallback(
+    async (profile: Profile) => {
+      try {
+        await api.deleteProfile(profile.user_id);
+        if (offset > 0 && profilePage?.profiles.length === 1) {
+          setOffset(Math.max(0, offset - profilePageSize));
+        } else {
+          setProfileRefreshKey((value) => value + 1);
+        }
         await loadDashboard();
       } catch (caught) {
         handleError(caught);
       }
     },
-    [handleError, loadDashboard],
+    [api, handleError, loadDashboard, offset, profilePage?.profiles.length],
   );
 
   const sessionColumns = useMemo<DataGridColumn<Session>[]>(
@@ -486,7 +779,6 @@ function Dashboard({token, onUnauthorized}: {token: string; onUnauthorized: () =
         header: "Profile",
         isRowHeader: true,
         accessorKey: "display_name",
-        allowsSorting: true,
         cell: (profile) => (
           <div className="min-w-44">
             <p className="font-medium text-foreground">{profile.display_name}</p>
@@ -524,14 +816,39 @@ function Dashboard({token, onUnauthorized}: {token: string; onUnauthorized: () =
         accessorKey: "created_at",
         cell: (profile) => <span className="whitespace-nowrap text-muted">{formatDate(profile.created_at)}</span>,
       },
+      {
+        id: "actions",
+        header: "Actions",
+        align: "end",
+        cell: (profile) => (
+          <div className="flex items-center justify-end gap-2 whitespace-nowrap">
+            <ResetPasswordAction
+              profile={profile}
+              onReset={(password) => resetProfilePassword(profile, password)}
+            />
+            <ConfirmAction
+              actionLabel="Delete"
+              actionIcon={faTrashCan}
+              body={`Permanently delete ${profile.display_name}? Their active session and saved login will be revoked. This cannot be undone.`}
+              heading="Delete profile?"
+              onConfirm={() => void deleteProfile(profile)}
+            />
+          </div>
+        ),
+      },
     ],
-    [],
+    [deleteProfile, resetProfilePassword],
   );
 
   const overview = dashboard?.overview;
   const profileTotal = profilePage ? Number(profilePage.total) : 0;
   const hasPreviousProfiles = offset > 0;
   const hasNextProfiles = profilePage ? offset + profilePage.profiles.length < profileTotal : false;
+  const liveStatusLabel = liveStatus === "live"
+    ? "Live updates"
+    : liveStatus === "reconnecting"
+      ? "Reconnecting"
+      : "Connecting";
 
   return (
     <div className="min-h-screen bg-background text-foreground">
@@ -542,12 +859,18 @@ function Dashboard({token, onUnauthorized}: {token: string; onUnauthorized: () =
             <div>
               <div className="flex items-center gap-3">
                 <h1 className="text-xl font-semibold tracking-tight">GeneralsX Server Admin</h1>
-                <Chip color="success" size="sm" variant="soft">
-                  <Chip.Label className="flex items-center gap-1.5">
-                    <FontAwesomeIcon aria-hidden="true" icon={overview?.status === "ok" ? faCircleCheck : faClock} />
-                    {overview?.status === "ok" ? "Online" : "Connecting"}
-                  </Chip.Label>
-                </Chip>
+                <span aria-live="polite">
+                  <Chip color={liveStatus === "live" ? "success" : "warning"} size="sm" variant="soft">
+                    <Chip.Label className="flex items-center gap-1.5">
+                      <FontAwesomeIcon
+                        aria-hidden="true"
+                        className={liveStatus === "reconnecting" ? "animate-spin motion-reduce:animate-none" : undefined}
+                        icon={liveStatus === "live" ? faCircleCheck : liveStatus === "reconnecting" ? faArrowsRotate : faClock}
+                      />
+                      {liveStatusLabel}
+                    </Chip.Label>
+                  </Chip>
+                </span>
               </div>
               <p className="mt-1 text-sm text-muted">
                 {overview ? `Protocol ${overview.protocol} · Up ${formatDuration(overview.uptime_seconds)}` : "Loading server state…"}
@@ -555,7 +878,7 @@ function Dashboard({token, onUnauthorized}: {token: string; onUnauthorized: () =
             </div>
           </div>
           <div className="flex gap-2">
-            <Button isDisabled={isRefreshing} variant="secondary" onPress={() => void loadDashboard()}>
+            <Button isDisabled={isRefreshing} variant="secondary" onPress={() => void refreshAll()}>
               <FontAwesomeIcon
                 aria-hidden="true"
                 className={isRefreshing ? "animate-spin motion-reduce:animate-none" : undefined}
@@ -581,7 +904,11 @@ function Dashboard({token, onUnauthorized}: {token: string; onUnauthorized: () =
               Overview
             </h2>
             <p className="mt-1 text-sm text-muted">
-              Live Online service health and capacity. Data refreshes every 15 seconds.
+              {liveStatus === "live"
+                ? "Live Online service health and capacity. Updates stream from the server."
+                : liveStatus === "reconnecting"
+                  ? "Live connection interrupted. REST fallback refreshes every 15 seconds while it reconnects."
+                  : "Connecting to live updates. REST fallback refreshes every 15 seconds."}
             </p>
           </div>
           <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
@@ -633,6 +960,35 @@ function Dashboard({token, onUnauthorized}: {token: string; onUnauthorized: () =
           </Card>
         </section>
 
+        <section aria-labelledby="relay-heading">
+          <Card variant="secondary">
+            <Card.Header className="flex-col items-start gap-1 px-6 pt-6">
+              <Card.Title id="relay-heading"><IconTitle icon={faSatelliteDish}>Relay activity</IconTitle></Card.Title>
+              <Card.Description>Opaque UDP traffic handled by the authenticated game relay.</Card.Description>
+            </Card.Header>
+            <Card.Content className="grid gap-x-8 gap-y-5 px-6 py-6 sm:grid-cols-2 lg:grid-cols-4">
+              {[
+                {icon: faArrowDown, label: "Inbound", value: `${formatInteger(overview?.relay.datagrams_in || "0")} packets · ${formatBytes(overview?.relay.bytes_in || "0")}`},
+                {icon: faArrowUp, label: "Outbound", value: `${formatInteger(overview?.relay.datagrams_out || "0")} packets · ${formatBytes(overview?.relay.bytes_out || "0")}`},
+                {icon: faShieldHalved, label: "Auth drops", value: formatInteger(overview?.relay.dropped_auth || "0")},
+                {icon: faGaugeHigh, label: "Rate-limit drops", value: formatInteger(overview?.relay.dropped_rate_limit || "0")},
+                {icon: faTriangleExclamation, label: "Malformed", value: formatInteger(overview?.relay.dropped_malformed || "0")},
+                {icon: faPlugCircleXmark, label: "No endpoint", value: formatInteger(overview?.relay.dropped_no_endpoint || "0")},
+                {icon: faClock, label: "Buffered before bind", value: formatInteger(overview?.relay.buffered_until_bind || "0")},
+                {icon: faLayerGroup, label: "Allocated games", value: formatInteger(overview?.relay.active_games || 0)},
+              ].map(({icon, label, value}) => (
+                <div className="flex gap-3" key={label}>
+                  <FontAwesomeIcon aria-hidden="true" className="mt-0.5 text-muted" fixedWidth icon={icon} />
+                  <div>
+                    <p className="text-sm text-muted">{label}</p>
+                    <p className="mt-1 font-medium tabular-nums text-foreground">{value}</p>
+                  </div>
+                </div>
+              ))}
+            </Card.Content>
+          </Card>
+        </section>
+
         <section aria-labelledby="games-heading">
           <Card variant="secondary">
             <Card.Header className="flex-col items-start gap-1 px-6 pt-6">
@@ -679,7 +1035,7 @@ function Dashboard({token, onUnauthorized}: {token: string; onUnauthorized: () =
               <DataGrid
                 aria-label="Stored profiles"
                 columns={profileColumns}
-                contentClassName="min-w-[760px]"
+                contentClassName="min-w-[1080px]"
                 data={profilePage?.profiles || []}
                 getRowId={(profile) => profile.user_id}
                 renderEmptyState={() => <EmptyTableState icon={faMagnifyingGlass}>No profiles match this search.</EmptyTableState>}
@@ -717,34 +1073,6 @@ function Dashboard({token, onUnauthorized}: {token: string; onUnauthorized: () =
           </Card>
         </section>
 
-        <section aria-labelledby="relay-heading">
-          <Card variant="secondary">
-            <Card.Header className="flex-col items-start gap-1 px-6 pt-6">
-              <Card.Title id="relay-heading"><IconTitle icon={faSatelliteDish}>Relay activity</IconTitle></Card.Title>
-              <Card.Description>Opaque UDP traffic handled by the authenticated game relay.</Card.Description>
-            </Card.Header>
-            <Card.Content className="grid gap-x-8 gap-y-5 px-6 py-6 sm:grid-cols-2 lg:grid-cols-4">
-              {[
-                {icon: faArrowDown, label: "Inbound", value: `${formatInteger(overview?.relay.datagrams_in || "0")} packets · ${formatBytes(overview?.relay.bytes_in || "0")}`},
-                {icon: faArrowUp, label: "Outbound", value: `${formatInteger(overview?.relay.datagrams_out || "0")} packets · ${formatBytes(overview?.relay.bytes_out || "0")}`},
-                {icon: faShieldHalved, label: "Auth drops", value: formatInteger(overview?.relay.dropped_auth || "0")},
-                {icon: faGaugeHigh, label: "Rate-limit drops", value: formatInteger(overview?.relay.dropped_rate_limit || "0")},
-                {icon: faTriangleExclamation, label: "Malformed", value: formatInteger(overview?.relay.dropped_malformed || "0")},
-                {icon: faPlugCircleXmark, label: "No endpoint", value: formatInteger(overview?.relay.dropped_no_endpoint || "0")},
-                {icon: faClock, label: "Buffered before bind", value: formatInteger(overview?.relay.buffered_until_bind || "0")},
-                {icon: faLayerGroup, label: "Allocated games", value: formatInteger(overview?.relay.active_games || 0)},
-              ].map(({icon, label, value}) => (
-                <div className="flex gap-3" key={label}>
-                  <FontAwesomeIcon aria-hidden="true" className="mt-0.5 text-muted" fixedWidth icon={icon} />
-                  <div>
-                    <p className="text-sm text-muted">{label}</p>
-                    <p className="mt-1 font-medium tabular-nums text-foreground">{value}</p>
-                  </div>
-                </div>
-              ))}
-            </Card.Content>
-          </Card>
-        </section>
       </main>
     </div>
   );

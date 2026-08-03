@@ -83,6 +83,20 @@ export interface Game {
   members: GameMember[];
 }
 
+export interface EventTicket {
+  ticket: string;
+  expires_at: string;
+}
+
+export interface SnapshotEvent {
+  type: "snapshot";
+  sequence: string;
+  profile_revision: string;
+  overview: Overview;
+  sessions: Session[];
+  games: Game[];
+}
+
 interface DataEnvelope<T> {
   data: T;
 }
@@ -138,6 +152,23 @@ export class AdminApi {
 
   closeGame(gameID: string): Promise<void> {
     return this.request<void>(`/api/admin/v1/games/${encodeURIComponent(gameID)}`, {method: "DELETE"});
+  }
+
+  // GeneralsX @feature OpenAI 02/08/2026 Expose profile management and short-lived realtime tickets to the admin UI.
+  resetPassword(userID: string, password: string): Promise<void> {
+    return this.request<void>(`/api/admin/v1/profiles/${encodeURIComponent(userID)}/password`, {
+      body: JSON.stringify({password}),
+      headers: {"Content-Type": "application/json"},
+      method: "PUT",
+    });
+  }
+
+  deleteProfile(userID: string): Promise<void> {
+    return this.request<void>(`/api/admin/v1/profiles/${encodeURIComponent(userID)}`, {method: "DELETE"});
+  }
+
+  eventTicket(signal?: AbortSignal): Promise<EventTicket> {
+    return this.request<EventTicket>("/api/admin/v1/events/ticket", {method: "POST", signal});
   }
 
   private async request<T>(path: string, init: RequestInit = {}): Promise<T> {

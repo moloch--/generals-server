@@ -193,19 +193,35 @@ binary with `embed.FS`; there is no runtime web directory to mount or manage.
 The login screen retains the bearer token only in the current browser tab's
 `sessionStorage`.
 
-Every endpoint below requires `Authorization: Bearer <token>` and returns a
-JSON `data` envelope except successful DELETE requests, which return 204:
+Every REST endpoint below requires `Authorization: Bearer <token>` and returns
+a JSON `data` envelope except successful profile/session/game mutations, which
+return 204:
 
 - `GET /api/admin/v1/overview`: process, hub, and relay counters.
 - `GET /api/admin/v1/profiles?query=&limit=&offset=`: searchable profile page.
+- `PUT /api/admin/v1/profiles/{userID}/password`: reset an account password.
+- `DELETE /api/admin/v1/profiles/{userID}`: permanently delete an account.
 - `GET /api/admin/v1/sessions`: active control sessions.
 - `DELETE /api/admin/v1/sessions/{userID}`: disconnect one player.
 - `GET /api/admin/v1/games`: staged and active games.
 - `DELETE /api/admin/v1/games/{gameID}`: close a game and remove its members.
+- `POST /api/admin/v1/events/ticket`: issue a 30-second, single-use realtime
+  connection ticket.
 
-Profile, player, game, and counter identifiers that could exceed JavaScript's
-safe integer range are serialized as strings. The server does not enable CORS,
-the API never returns credentials, and disruptive actions are logged by ID.
+The dashboard exchanges its bearer token for the short-lived ticket and opens
+`GET /api/admin/v1/events?ticket=...` as a same-origin WebSocket. The stream
+pushes overview, session, game, relay, and profile-revision snapshots once per
+second; the browser falls back to periodic REST refreshes while disconnected.
+The long-lived admin token is never placed in a URL.
+
+Resetting a password or deleting a profile revokes saved resume tokens,
+pending admissions, and any active control connection. Profile deletion also
+cascades through the account's buddy relationships and pending requests.
+
+Profile, player, game, snapshot, and counter identifiers that could exceed
+JavaScript's safe integer range are serialized as strings. The server does not
+enable CORS, the API never returns credentials, and disruptive actions are
+logged by ID.
 
 From another device on the same tailnet, open:
 

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -15,6 +16,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
+	"github.com/coder/websocket/wsjson"
 )
 
 const testAdminToken = "0123456789abcdefghijklmnopqrstuvwxyz-ADMIN"
@@ -39,8 +43,16 @@ func testAdminHandler(t *testing.T, store *ProfileStore, hub *Hub, relay *Relay)
 
 func adminRequest(t *testing.T, handler http.Handler, method, target string) *httptest.ResponseRecorder {
 	t.Helper()
-	request := httptest.NewRequest(method, target, nil)
+	return adminRequestBody(t, handler, method, target, "", "")
+}
+
+func adminRequestBody(t *testing.T, handler http.Handler, method, target, contentType, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	request := httptest.NewRequest(method, target, strings.NewReader(body))
 	request.Header.Set("Authorization", "Bearer "+testAdminToken)
+	if contentType != "" {
+		request.Header.Set("Content-Type", contentType)
+	}
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	return response
@@ -264,6 +276,251 @@ func TestAdminProfilesPaginationSearchAndExactCounters(t *testing.T) {
 	}
 }
 
+func TestAdminProfileManagementResetsAndDeletesAccountsWithoutLeakingSecrets(t *testing.T) {
+	store, err := OpenProfileStore("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := DefaultConfig()
+	relay := NewRelay(cfg, nil)
+	hub := NewHub(cfg, nil, store, relay)
+	var audit bytes.Buffer
+	hash := adminTokenHash(sha256.Sum256([]byte(testAdminToken)))
+	handler := newAdminHandler(hash, store, hub, relay, slog.New(slog.NewTextHandler(&audit, nil)), time.Now().Add(-time.Minute))
+	t.Cleanup(func() { _ = handler.shutdownEvents(context.Background()) })
+
+	profile, err := store.Register("managed_user", "original password", "Managed User")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := hub.ReserveProfile(profile); err != nil {
+		t.Fatal(err)
+	}
+	resumeToken, _, err := hub.IssueSession(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := newPersistentHubClient(t, cfg, profile)
+	if _, err := hub.Connect(client); err != nil {
+		t.Fatal(err)
+	}
+
+	const replacementPassword = "replacement password"
+	reset := adminRequestBody(t, handler, http.MethodPut,
+		"http://admin.test/api/admin/v1/profiles/"+strconv.FormatUint(profile.UserID, 10)+"/password",
+		"application/json", `{"password":"`+replacementPassword+`"}`)
+	if reset.Code != http.StatusNoContent || reset.Body.Len() != 0 {
+		t.Fatalf("reset response status=%d body=%q", reset.Code, reset.Body.String())
+	}
+	requireClientClosed(t, client)
+	if _, err := store.Authenticate(profile.Username, "original password"); err == nil {
+		t.Fatal("original password remained valid after admin reset")
+	}
+	updatedProfile, err := store.Authenticate(profile.Username, replacementPassword)
+	if err != nil {
+		t.Fatalf("replacement password was rejected: %v", err)
+	}
+	if _, err := hub.ResumeAndReserve(resumeToken); err == nil {
+		t.Fatal("resume token survived admin password reset")
+	}
+
+	invalidRequests := []struct {
+		target      string
+		contentType string
+		body        string
+	}{
+		{target: "http://admin.test/api/admin/v1/profiles/not-a-number/password", contentType: "application/json", body: `{"password":"valid password"}`},
+		{target: "http://admin.test/api/admin/v1/profiles/" + strconv.FormatUint(profile.UserID, 10) + "/password", contentType: "text/plain", body: `{"password":"valid password"}`},
+		{target: "http://admin.test/api/admin/v1/profiles/" + strconv.FormatUint(profile.UserID, 10) + "/password", contentType: "application/json", body: `{"password":"short"}`},
+		{target: "http://admin.test/api/admin/v1/profiles/" + strconv.FormatUint(profile.UserID, 10) + "/password", contentType: "application/json", body: `{"password":"valid password","unexpected":true}`},
+		{target: "http://admin.test/api/admin/v1/profiles/" + strconv.FormatUint(profile.UserID, 10) + "/password", contentType: "application/json", body: `{"password":"valid password"}{}`},
+	}
+	for _, test := range invalidRequests {
+		response := adminRequestBody(t, handler, http.MethodPut, test.target, test.contentType, test.body)
+		if response.Code != http.StatusBadRequest {
+			t.Errorf("invalid reset %q status=%d body=%s", test.body, response.Code, response.Body.String())
+		}
+	}
+	missingReset := adminRequestBody(t, handler, http.MethodPut,
+		"http://admin.test/api/admin/v1/profiles/999999/password", "application/json", `{"password":"valid password"}`)
+	if missingReset.Code != http.StatusNotFound {
+		t.Fatalf("missing reset status=%d body=%s", missingReset.Code, missingReset.Body.String())
+	}
+
+	if err := hub.ReserveProfile(updatedProfile); err != nil {
+		t.Fatal(err)
+	}
+	deleteToken, _, err := hub.IssueSession(updatedProfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteClient := newPersistentHubClient(t, cfg, updatedProfile)
+	if _, err := hub.Connect(deleteClient); err != nil {
+		t.Fatal(err)
+	}
+	deleteTarget := "http://admin.test/api/admin/v1/profiles/" + strconv.FormatUint(profile.UserID, 10)
+	deleted := adminRequest(t, handler, http.MethodDelete, deleteTarget)
+	if deleted.Code != http.StatusNoContent || deleted.Body.Len() != 0 {
+		t.Fatalf("delete response status=%d body=%q", deleted.Code, deleted.Body.String())
+	}
+	requireClientClosed(t, deleteClient)
+	if _, exists := store.Get(profile.UserID); exists {
+		t.Fatal("admin-deleted profile remained in SQLite")
+	}
+	if _, err := hub.ResumeAndReserve(deleteToken); err == nil {
+		t.Fatal("resume token survived admin profile deletion")
+	}
+	if second := adminRequest(t, handler, http.MethodDelete, deleteTarget); second.Code != http.StatusNotFound {
+		t.Fatalf("second delete status=%d body=%s", second.Code, second.Body.String())
+	}
+
+	logs := audit.String()
+	if strings.Contains(logs, replacementPassword) || strings.Contains(logs, "original password") {
+		t.Fatalf("admin audit log exposed a password: %s", logs)
+	}
+}
+
+func TestAdminRealtimeTicketsAreSingleUseAndPushSnapshots(t *testing.T) {
+	store, err := OpenProfileStore("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := DefaultConfig()
+	relay := NewRelay(cfg, nil)
+	hub := NewHub(cfg, nil, store, relay)
+	hash := adminTokenHash(sha256.Sum256([]byte(testAdminToken)))
+	handler := newAdminHandler(hash, store, hub, relay, slog.New(slog.NewTextHandler(io.Discard, nil)), time.Now().Add(-time.Minute))
+	server := httptest.NewServer(handler)
+	t.Cleanup(func() {
+		_ = handler.shutdownEvents(context.Background())
+		server.Close()
+	})
+
+	unauthorized, err := http.Post(server.URL+"/api/admin/v1/events/ticket", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unauthorized.Body.Close()
+	if unauthorized.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthorized ticket status=%d", unauthorized.StatusCode)
+	}
+
+	crossOriginTicket := requestAdminEventTicket(t, server.URL)
+	crossOriginURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/admin/v1/events?ticket=" + crossOriginTicket
+	crossOriginContext, cancelCrossOrigin := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancelCrossOrigin()
+	crossOriginConnection, crossOriginResponse, err := websocket.Dial(crossOriginContext, crossOriginURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{"Origin": []string{"https://attacker.example"}},
+	})
+	if crossOriginConnection != nil {
+		crossOriginConnection.CloseNow()
+		t.Fatal("cross-origin realtime connection was accepted")
+	}
+	if err == nil || crossOriginResponse == nil {
+		t.Fatalf("cross-origin dial error=%v response=%v", err, crossOriginResponse)
+	}
+	crossOriginResponse.Body.Close()
+	if crossOriginResponse.StatusCode != http.StatusForbidden {
+		t.Fatalf("cross-origin realtime status=%d, want %d", crossOriginResponse.StatusCode, http.StatusForbidden)
+	}
+	handler.eventsMu.Lock()
+	crossOriginCount := handler.eventConnectionCount
+	crossOriginTracked := len(handler.eventConnections)
+	handler.eventsMu.Unlock()
+	if crossOriginCount != 0 || crossOriginTracked != 0 {
+		t.Fatalf("rejected cross-origin connection left count=%d tracked=%d", crossOriginCount, crossOriginTracked)
+	}
+
+	ticket := requestAdminEventTicket(t, server.URL)
+	websocketURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/admin/v1/events?ticket=" + ticket
+	dialContext, cancelDial := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancelDial()
+	connection, response, err := websocket.Dial(dialContext, websocketURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{"Origin": []string{server.URL}},
+	})
+	if err != nil {
+		if response != nil {
+			response.Body.Close()
+		}
+		t.Fatal(err)
+	}
+	defer connection.CloseNow()
+
+	readContext, cancelRead := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancelRead()
+	var initial adminEventSnapshot
+	if err := wsjson.Read(readContext, connection, &initial); err != nil {
+		t.Fatal(err)
+	}
+	if initial.Type != "snapshot" || initial.Sequence == "" || initial.ProfileRevision != "0" || initial.Overview.Status != "ok" {
+		t.Fatalf("unexpected initial realtime snapshot: %+v", initial)
+	}
+
+	if _, err := store.Register("realtime_user", "realtime password", "Realtime User"); err != nil {
+		t.Fatal(err)
+	}
+	var updated adminEventSnapshot
+	for updated.ProfileRevision != "1" {
+		if err := wsjson.Read(readContext, connection, &updated); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if updated.ProfileRevision != "1" || updated.Overview.ProfileCount != "1" {
+		t.Fatalf("profile change was not pushed: %+v", updated)
+	}
+
+	reused, err := http.Get(server.URL + "/api/admin/v1/events?ticket=" + ticket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reused.Body.Close()
+	if reused.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("reused ticket status=%d", reused.StatusCode)
+	}
+	expiredTicket, _, err := handler.issueEventTicket(time.Now().Add(-2 * adminEventTicketTTL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	expired, err := http.Get(server.URL + "/api/admin/v1/events?ticket=" + expiredTicket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expired.Body.Close()
+	if expired.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expired ticket status=%d", expired.StatusCode)
+	}
+}
+
+func requestAdminEventTicket(t *testing.T, baseURL string) string {
+	t.Helper()
+	request, err := http.NewRequest(http.MethodPost, baseURL+"/api/admin/v1/events/ticket", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+testAdminToken)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("ticket status=%d body=%s", response.StatusCode, body)
+	}
+	var envelope struct {
+		Data adminEventTicket `json:"data"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Data.Ticket == "" || envelope.Data.ExpiresAt == "" {
+		t.Fatalf("invalid ticket response: %+v", envelope.Data)
+	}
+	return envelope.Data.Ticket
+}
+
 func TestAdminLiveSnapshotsAndActionsPreserveExactGuestID(t *testing.T) {
 	store, err := OpenProfileStore("")
 	if err != nil {
@@ -402,11 +659,36 @@ func TestServerAdminLifecycleAndBindFailureCleanup(t *testing.T) {
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("live admin status = %s", response.Status)
 	}
+	baseURL := "http://" + server.AdminAddress()
+	ticket := requestAdminEventTicket(t, baseURL)
+	websocketContext, cancelWebsocket := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancelWebsocket()
+	events, upgradeResponse, err := websocket.Dial(websocketContext,
+		"ws://"+server.AdminAddress()+"/api/admin/v1/events?ticket="+ticket, nil)
+	if err != nil {
+		if upgradeResponse != nil {
+			upgradeResponse.Body.Close()
+		}
+		t.Fatal(err)
+	}
+	defer events.CloseNow()
+	var liveSnapshot adminEventSnapshot
+	if err := wsjson.Read(websocketContext, events, &liveSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	if liveSnapshot.Type != "snapshot" {
+		t.Fatalf("live snapshot type = %q", liveSnapshot.Type)
+	}
 	address := server.AdminAddress()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		t.Fatal(err)
+	}
+	closedContext, cancelClosed := context.WithTimeout(context.Background(), time.Second)
+	defer cancelClosed()
+	if err := wsjson.Read(closedContext, events, &liveSnapshot); err == nil {
+		t.Fatal("admin WebSocket remained readable after server shutdown")
 	}
 	if _, err := net.DialTimeout("tcp", address, 200*time.Millisecond); err == nil {
 		t.Fatal("admin listener remained open after shutdown")

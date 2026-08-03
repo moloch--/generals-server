@@ -41,11 +41,15 @@ var ErrProfileLimit = errors.New("persistent profile limit reached")
 var memoryDatabaseID atomic.Uint64
 
 type ProfileStore struct {
-	db          *sql.DB
-	maxProfiles int
-	closeOnce   sync.Once
-	closeErr    error
+	db              *sql.DB
+	maxProfiles     int
+	visibleRevision atomic.Uint64
+	closeOnce       sync.Once
+	closeErr        error
 }
+
+// GeneralsX @feature OpenAI 02/08/2026 Identify the exact stored credential without retaining plaintext passwords.
+type credentialStamp [sha256.Size]byte
 
 type storedAdminProfile struct {
 	Profile Profile
@@ -289,6 +293,14 @@ func (s *ProfileStore) Close() error {
 	return s.closeErr
 }
 
+// GeneralsX @feature OpenAI 02/08/2026 Track profile-table invalidations for realtime administrators.
+// VisibleRevision changes after a committed profile mutation that may require
+// an administrator's profile view to be refreshed. It is process-local and is
+// intended only as an invalidation token, not as durable profile data.
+func (s *ProfileStore) VisibleRevision() uint64 {
+	return s.visibleRevision.Load()
+}
+
 func (s *ProfileStore) profileCount(ctx context.Context) (uint64, error) {
 	var count int64
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM profiles`).Scan(&count); err != nil {
@@ -385,21 +397,26 @@ func escapeSQLiteLike(value string) string {
 }
 
 func (s *ProfileStore) Register(username, password, displayName string) (Profile, error) {
+	profile, _, err := s.registerWithCredentialStamp(username, password, displayName)
+	return profile, err
+}
+
+func (s *ProfileStore) registerWithCredentialStamp(username, password, displayName string) (Profile, credentialStamp, error) {
 	username = strings.TrimSpace(username)
 	displayName = strings.TrimSpace(displayName)
 	if !usernamePattern.MatchString(username) {
-		return Profile{}, errors.New("username must be 3-24 letters, digits, dots, dashes, or underscores")
+		return Profile{}, credentialStamp{}, errors.New("username must be 3-24 letters, digits, dots, dashes, or underscores")
 	}
 	if err := validatePassword(password); err != nil {
-		return Profile{}, err
+		return Profile{}, credentialStamp{}, err
 	}
 	if err := validateDisplayName(displayName); err != nil {
-		return Profile{}, err
+		return Profile{}, credentialStamp{}, err
 	}
 
 	salt := make([]byte, 16)
 	if _, err := rand.Read(salt); err != nil {
-		return Profile{}, fmt.Errorf("generate password salt: %w", err)
+		return Profile{}, credentialStamp{}, fmt.Errorf("generate password salt: %w", err)
 	}
 	hash := derivePassword([]byte(password), salt, passwordIterations, passwordKeyBytes)
 	profile := Profile{
@@ -410,26 +427,26 @@ func (s *ProfileStore) Register(username, password, displayName string) (Profile
 
 	tx, err := s.db.Begin()
 	if err != nil {
-		return Profile{}, fmt.Errorf("begin profile registration: %w", err)
+		return Profile{}, credentialStamp{}, fmt.Errorf("begin profile registration: %w", err)
 	}
 	defer tx.Rollback()
 
 	var count int
 	if err := tx.QueryRow(`SELECT COUNT(*) FROM profiles`).Scan(&count); err != nil {
-		return Profile{}, fmt.Errorf("count profiles: %w", err)
+		return Profile{}, credentialStamp{}, fmt.Errorf("count profiles: %w", err)
 	}
 	if count >= s.maxProfiles {
-		return Profile{}, ErrProfileLimit
+		return Profile{}, credentialStamp{}, ErrProfileLimit
 	}
 	if exists, err := profileValueExists(tx, "username_key", normalizeUsername(username)); err != nil {
-		return Profile{}, err
+		return Profile{}, credentialStamp{}, err
 	} else if exists {
-		return Profile{}, errors.New("username already exists")
+		return Profile{}, credentialStamp{}, errors.New("username already exists")
 	}
 	if exists, err := profileValueExists(tx, "display_name_key", normalizeDisplayName(displayName)); err != nil {
-		return Profile{}, err
+		return Profile{}, credentialStamp{}, err
 	} else if exists {
-		return Profile{}, errors.New("display name already exists")
+		return Profile{}, credentialStamp{}, errors.New("display name already exists")
 	}
 
 	result, err := tx.Exec(`
@@ -440,20 +457,21 @@ func (s *ProfileStore) Register(username, password, displayName string) (Profile
 		username, normalizeUsername(username), displayName, normalizeDisplayName(displayName),
 		profile.CreatedAt.Format(time.RFC3339Nano), salt, hash, passwordIterations)
 	if err != nil {
-		return Profile{}, fmt.Errorf("insert profile: %w", err)
+		return Profile{}, credentialStamp{}, fmt.Errorf("insert profile: %w", err)
 	}
 	id, err := result.LastInsertId()
 	if err != nil {
-		return Profile{}, fmt.Errorf("read profile id: %w", err)
+		return Profile{}, credentialStamp{}, fmt.Errorf("read profile id: %w", err)
 	}
 	if id < 1 {
-		return Profile{}, errors.New("profile database generated an invalid id")
+		return Profile{}, credentialStamp{}, errors.New("profile database generated an invalid id")
 	}
 	profile.UserID = uint64(id)
 	if err := tx.Commit(); err != nil {
-		return Profile{}, fmt.Errorf("commit profile registration: %w", err)
+		return Profile{}, credentialStamp{}, fmt.Errorf("commit profile registration: %w", err)
 	}
-	return profile, nil
+	s.visibleRevision.Add(1)
+	return profile, makeCredentialStamp(profile.UserID, salt, hash, passwordIterations), nil
 }
 
 func profileValueExists(tx *sql.Tx, column, value string) (bool, error) {
@@ -466,6 +484,11 @@ func profileValueExists(tx *sql.Tx, column, value string) (bool, error) {
 }
 
 func (s *ProfileStore) Authenticate(username, password string) (Profile, error) {
+	profile, _, err := s.authenticateWithCredentialStamp(username, password)
+	return profile, err
+}
+
+func (s *ProfileStore) authenticateWithCredentialStamp(username, password string) (Profile, credentialStamp, error) {
 	row := s.db.QueryRow(`
 		SELECT id, username, display_name, created_at, password_salt, password_hash, password_iterations
 		FROM profiles WHERE username_key = ?`, normalizeUsername(username))
@@ -478,24 +501,118 @@ func (s *ProfileStore) Authenticate(username, password string) (Profile, error) 
 		if errors.Is(err, sql.ErrNoRows) {
 			dummySalt := make([]byte, 16)
 			_ = derivePassword([]byte(password), dummySalt, passwordIterations, passwordKeyBytes)
-			return Profile{}, errors.New("invalid username or password")
+			return Profile{}, credentialStamp{}, errors.New("invalid username or password")
 		}
-		return Profile{}, fmt.Errorf("read credentials: %w", err)
+		return Profile{}, credentialStamp{}, fmt.Errorf("read credentials: %w", err)
 	}
 	if id < 1 || len(salt) != 16 || len(want) < 1 || iterations < 1 || iterations > 10_000_000 {
-		return Profile{}, errors.New("stored credentials are corrupt")
+		return Profile{}, credentialStamp{}, errors.New("stored credentials are corrupt")
 	}
 	created, err := time.Parse(time.RFC3339Nano, createdAt)
 	if err != nil {
-		return Profile{}, errors.New("stored profile is corrupt")
+		return Profile{}, credentialStamp{}, errors.New("stored profile is corrupt")
 	}
 	profile.UserID = uint64(id)
 	profile.CreatedAt = created
 	got := derivePassword([]byte(password), salt, iterations, len(want))
 	if subtle.ConstantTimeCompare(got, want) != 1 {
-		return Profile{}, errors.New("invalid username or password")
+		return Profile{}, credentialStamp{}, errors.New("invalid username or password")
 	}
-	return profile, nil
+	return profile, makeCredentialStamp(profile.UserID, salt, want, iterations), nil
+}
+
+func (s *ProfileStore) currentCredentialStamp(id uint64) (credentialStamp, bool, error) {
+	databaseID, ok := sqliteID(id)
+	if !ok {
+		return credentialStamp{}, false, nil
+	}
+	var salt, hash []byte
+	var iterations int
+	if err := s.db.QueryRow(`
+		SELECT password_salt, password_hash, password_iterations
+		FROM profiles WHERE id = ?`, databaseID).Scan(&salt, &hash, &iterations); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return credentialStamp{}, false, nil
+		}
+		return credentialStamp{}, false, fmt.Errorf("read current credentials: %w", err)
+	}
+	if len(salt) != 16 || len(hash) < 1 || iterations < 1 || iterations > 10_000_000 {
+		return credentialStamp{}, false, errors.New("stored credentials are corrupt")
+	}
+	return makeCredentialStamp(id, salt, hash, iterations), true, nil
+}
+
+func makeCredentialStamp(id uint64, salt, hash []byte, iterations int) credentialStamp {
+	var header [16]byte
+	binary.BigEndian.PutUint64(header[:8], id)
+	binary.BigEndian.PutUint64(header[8:], uint64(iterations))
+	digest := sha256.New()
+	_, _ = digest.Write(header[:])
+	_, _ = digest.Write(salt)
+	_, _ = digest.Write(hash)
+	var stamp credentialStamp
+	copy(stamp[:], digest.Sum(nil))
+	return stamp
+}
+
+// GeneralsX @feature OpenAI 02/08/2026 Let authenticated administrators reset persistent credentials.
+func (s *ProfileStore) ResetPassword(id uint64, password string) (bool, error) {
+	if err := validatePassword(password); err != nil {
+		return false, err
+	}
+	databaseID, ok := sqliteID(id)
+	if !ok {
+		return false, nil
+	}
+
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		return false, fmt.Errorf("generate password salt: %w", err)
+	}
+	hash := derivePassword([]byte(password), salt, passwordIterations, passwordKeyBytes)
+	result, err := s.db.Exec(`
+		UPDATE profiles
+		SET password_salt = ?, password_hash = ?, password_iterations = ?
+		WHERE id = ?`, salt, hash, passwordIterations, databaseID)
+	if err != nil {
+		return false, fmt.Errorf("reset profile password: %w", err)
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("inspect profile password reset: %w", err)
+	}
+	if updated == 0 {
+		return false, nil
+	}
+	if updated != 1 {
+		return false, fmt.Errorf("profile password reset affected %d rows", updated)
+	}
+	s.visibleRevision.Add(1)
+	return true, nil
+}
+
+// GeneralsX @feature OpenAI 02/08/2026 Let authenticated administrators delete persistent accounts atomically.
+func (s *ProfileStore) DeleteProfile(id uint64) (bool, error) {
+	databaseID, ok := sqliteID(id)
+	if !ok {
+		return false, nil
+	}
+	result, err := s.db.Exec(`DELETE FROM profiles WHERE id = ?`, databaseID)
+	if err != nil {
+		return false, fmt.Errorf("delete profile: %w", err)
+	}
+	deleted, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("inspect profile deletion: %w", err)
+	}
+	if deleted == 0 {
+		return false, nil
+	}
+	if deleted != 1 {
+		return false, fmt.Errorf("profile deletion affected %d rows", deleted)
+	}
+	s.visibleRevision.Add(1)
+	return true, nil
 }
 
 func (s *ProfileStore) Get(id uint64) (Profile, bool) {
@@ -606,6 +723,9 @@ func (s *ProfileStore) ApplyStatsBatch(updates map[uint64]PlayerStats) (map[uint
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit stats update: %w", err)
+	}
+	if len(updates) != 0 {
+		s.visibleRevision.Add(1)
 	}
 	return result, nil
 }
@@ -868,6 +988,7 @@ func (s *ProfileStore) UpdateDisplayName(id uint64, displayName string) (Profile
 		return Profile{}, fmt.Errorf("commit display name update: %w", err)
 	}
 	profile.DisplayName = displayName
+	s.visibleRevision.Add(1)
 	return profile, nil
 }
 
