@@ -16,8 +16,10 @@ The game command-line flag `-onlineServer <endpoint>` selects the control
 endpoint. `tls://host[:control-port]` requires verified TLS and enables
 persistent account authentication. A bare `host[:control-port]` is explicit
 plaintext guest mode for local development. The server advertises the public
-relay host and actual relay port in `game.started`; the client must not derive
-the relay endpoint from the control endpoint.
+relay host and UDP port in `game.started`; the client must not derive the relay
+endpoint from the control endpoint. The port is the bound relay port by
+default, or the explicit `--public-relay-port` value when an external
+NAT/firewall mapping differs.
 
 ## Control framing and envelopes
 
@@ -114,7 +116,7 @@ acceptance-only slot-list echo with the same key does not.
 ```json
 {
   "product":"zerohour",
-  "compatibility_version":1,
+  "compatibility_version":2,
   "ini_crc":1865069505,
   "game_id":"0123456789abcdef",
   "name":"No Rush",
@@ -130,7 +132,8 @@ acceptance-only slot-list echo with the same key does not.
 The top-level compatibility tuple is immutable for the lifetime of the game:
 
 - `product` is exactly `generals` or `zerohour`;
-- `compatibility_version` is currently `1`;
+- `compatibility_version` is currently `2`; generation `1` clients used the
+  earlier platform-native simulation math contract and are rejected;
 - `ini_crc` is the client's unsigned 32-bit checksum of compatibility-relevant
   game INI data.
 
@@ -146,7 +149,7 @@ snapshot adds `members` and the complete `options` object:
 ```json
 {
   "product":"zerohour",
-  "compatibility_version":1,
+  "compatibility_version":2,
   "ini_crc":1865069505,
   "game_id":"0123456789abcdef",
   "name":"No Rush",
@@ -272,8 +275,8 @@ Chat sends:
 | Command | Request `data` | Successful response `data` |
 |---|---|---|
 | `game.list` | `{}` | `{"games":[GameSummary,...]}` |
-| `game.create` | `{"product":"zerohour","compatibility_version":1,"ini_crc":1865069505,"name":"Game","password":"","max_players":8,"options":GameOptions}` | `{"game":GameSnapshot}` |
-| `game.join` | `{"product":"zerohour","compatibility_version":1,"ini_crc":1865069505,"game_id":"0123456789abcdef","password":""}` | `{"game":GameSnapshot}` |
+| `game.create` | `{"product":"zerohour","compatibility_version":2,"ini_crc":1865069505,"name":"Game","password":"","max_players":8,"options":GameOptions}` | `{"game":GameSnapshot}` |
+| `game.join` | `{"product":"zerohour","compatibility_version":2,"ini_crc":1865069505,"game_id":"0123456789abcdef","password":""}` | `{"game":GameSnapshot}` |
 | `game.leave` | `{}` | `{"left":true}` |
 | `game.options` | Any subset of `name`, `password`, `max_players`, `options` | `{"game":GameSnapshot}` |
 | `game.ready` | `{"ready":true}` | `{"ready":true}` |
@@ -368,6 +371,12 @@ game and relay, releases all members, and emits `game.ended` with reason
 captured at `game.go` remains the authority for `stats.results`, so a host can
 still report a departed launch player as `disconnect`.
 
+When the relay receives no authenticated Bind, Keepalive, or Data traffic for
+`--game-idle-timeout` (15 minutes by default), it terminates the allocation and
+the matching control-plane game. Connected participants receive `game.ended`
+with reason `relay_idle_timeout`, and all participants are released to stage or
+join another game.
+
 Before relay allocation, a staged host departure dissolves the open lobby.
 Remaining members first receive a final `game.updated` without the host and
 with host-authored `opaque`, `slot_list`, and `ready_key` cleared, followed by
@@ -442,13 +451,13 @@ storage error can be retried.
 
 | Command | Request `data` | Successful response `data` |
 |---|---|---|
-| `quickmatch.enqueue` | `{"product":"zerohour","compatibility_version":1,"ini_crc":1865069505,"mode":"1v1"}` | Queued or matched result |
+| `quickmatch.enqueue` | `{"product":"zerohour","compatibility_version":2,"ini_crc":1865069505,"mode":"1v1"}` | Queued or matched result |
 | `quickmatch.cancel` | `{}` | `{"cancelled":true}` |
 
 The first player waits. A queued response echoes the immutable matching key:
 
 ```json
-{"queued":true,"mode":"1v1","product":"zerohour","compatibility_version":1,"ini_crc":1865069505}
+{"queued":true,"mode":"1v1","product":"zerohour","compatibility_version":2,"ini_crc":1865069505}
 ```
 
 Only a second waiting player with the identical mode, product, compatibility

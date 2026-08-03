@@ -784,6 +784,10 @@ func (h *Hub) updateGameOptions(client *controlClient, raw json.RawMessage) (any
 		options = *request.Options
 	}
 	resetReady := request.Options != nil && options.ReadyKey != game.options.ReadyKey
+	changed := name != game.name || password != game.password || maxPlayers != game.maxPlayers || options != game.options
+	if !changed {
+		return map[string]any{"game": h.gameSnapshotLocked(game)}, false, nil
+	}
 	game.name = name
 	game.password = password
 	game.maxPlayers = maxPlayers
@@ -1114,9 +1118,6 @@ func (h *Hub) buddyStatus(client *controlClient, raw json.RawMessage) (any, bool
 }
 
 func (h *Hub) statsGet(client *controlClient, raw json.RawMessage) (any, bool, error) {
-	if client.profile.Guest {
-		return nil, false, commandErr("persistent_profile_required", "guest profiles do not have stats")
-	}
 	var request struct {
 		UserID uint64 `json:"user_id,omitempty"`
 	}
@@ -1125,6 +1126,16 @@ func (h *Hub) statsGet(client *controlClient, raw json.RawMessage) (any, bool, e
 	}
 	if request.UserID == 0 {
 		request.UserID = client.profile.UserID
+	}
+	guest := request.UserID == client.profile.UserID && client.profile.Guest
+	if !guest {
+		h.mu.RLock()
+		target := h.clients[request.UserID]
+		guest = target != nil && target.profile.Guest
+		h.mu.RUnlock()
+	}
+	if guest {
+		return map[string]any{"user_id": request.UserID, "stats": PlayerStats{}}, false, nil
 	}
 	stats, ok := h.store.Stats(request.UserID)
 	if !ok {
@@ -1514,6 +1525,16 @@ func (h *Hub) handleStartReadyTimeout(gameID, generation uint64) {
 		return
 	}
 	h.dissolveGameLocked(game, "start_timeout", nil)
+}
+
+func (h *Hub) handleRelayGameExpired(gameID uint64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	game := h.games[gameID]
+	if game == nil || (game.state != "starting" && game.state != "started") {
+		return
+	}
+	h.dissolveGameLocked(game, "relay_idle_timeout", nil)
 }
 
 func (h *Hub) refreshSnapshotsForUserLocked(userID uint64) {

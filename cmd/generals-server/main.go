@@ -93,6 +93,7 @@ func newRootCommand(runner *commandRunner) *cobra.Command {
 	flags.StringVar(&cfg.AdminAddr, "admin-listen", cfg.AdminAddr, "HTTP admin API and web interface listen address (disabled by default)")
 	flags.StringVar(&cfg.AdminTokenFile, "admin-token-file", cfg.AdminTokenFile, "file containing the admin bearer token")
 	flags.StringVar(&cfg.PublicHost, "public-host", cfg.PublicHost, "public relay hostname advertised to clients")
+	flags.IntVar(&cfg.PublicRelayPort, "public-relay-port", cfg.PublicRelayPort, "public UDP relay port advertised to clients (zero uses the bound port)")
 	flags.StringVar(&cfg.DataFile, "data-file", cfg.DataFile, "SQLite profile database path")
 	flags.StringVar(&cfg.TLSCertFile, "tls-cert", cfg.TLSCertFile, "PEM certificate for TLS control connections")
 	flags.StringVar(&cfg.TLSKeyFile, "tls-key", cfg.TLSKeyFile, "PEM private key for TLS control connections")

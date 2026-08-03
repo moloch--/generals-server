@@ -4,7 +4,7 @@ import "time"
 
 const (
 	ProtocolVersion          = 1
-	GameCompatibilityVersion = 1
+	GameCompatibilityVersion = 2
 )
 
 type GameCompatibility struct {

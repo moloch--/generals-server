@@ -14,6 +14,7 @@ type Config struct {
 	AdminAddr                 string
 	AdminTokenFile            string
 	PublicHost                string
+	PublicRelayPort           int
 	DataFile                  string
 	TLSCertFile               string
 	TLSKeyFile                string
