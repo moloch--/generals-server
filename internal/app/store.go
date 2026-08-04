@@ -148,9 +148,16 @@ func profileDatabaseDSN(path string) (dsn, databasePath string, err error) {
 	}
 
 	query.Add("_pragma", "synchronous(FULL)")
+	databaseURLPath := filepath.ToSlash(absolutePath)
+	// GeneralsX @bugfix Codex 04/08/2026 Encode Windows drive paths as
+	// file:///C:/... rather than file://C:/..., which SQLite interprets as an
+	// invalid URI authority.
+	if filepath.VolumeName(absolutePath) != "" && !strings.HasPrefix(databaseURLPath, "/") {
+		databaseURLPath = "/" + databaseURLPath
+	}
 	databaseURL := url.URL{
 		Scheme:   "file",
-		Path:     filepath.ToSlash(absolutePath),
+		Path:     databaseURLPath,
 		RawQuery: query.Encode(),
 	}
 	return databaseURL.String(), absolutePath, nil
