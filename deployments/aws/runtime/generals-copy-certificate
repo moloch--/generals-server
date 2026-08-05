@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source /etc/generals-server/host.conf
+
+hostname=$(printf '%s' "$HOSTNAME_B64" | base64 --decode)
+lineage_directory="/srv/generals/letsencrypt/live/$hostname"
+tls_directory=/srv/generals/tls
+
+exec 9>/run/lock/generals-certificate.lock
+flock 9
+
+[[ -s "$lineage_directory/fullchain.pem" ]]
+[[ -s "$lineage_directory/privkey.pem" ]]
+install -d -m 0700 -o 65532 -g 65532 "$tls_directory"
+
+if [[ ! -f "$tls_directory/fullchain.pem" ]] ||
+  [[ ! -f "$tls_directory/privkey.pem" ]] ||
+  ! cmp --silent "$lineage_directory/fullchain.pem" "$tls_directory/fullchain.pem" ||
+  ! cmp --silent "$lineage_directory/privkey.pem" "$tls_directory/privkey.pem"; then
+  temporary_fullchain="$tls_directory/.fullchain.pem.new"
+  temporary_privkey="$tls_directory/.privkey.pem.new"
+  trap 'rm -f "$temporary_fullchain" "$temporary_privkey"' EXIT
+
+  install -m 0600 -o 65532 -g 65532 "$lineage_directory/fullchain.pem" "$temporary_fullchain"
+  install -m 0600 -o 65532 -g 65532 "$lineage_directory/privkey.pem" "$temporary_privkey"
+  mv -f "$temporary_fullchain" "$tls_directory/fullchain.pem"
+  mv -f "$temporary_privkey" "$tls_directory/privkey.pem"
+  trap - EXIT
+fi
+
+certificate_hash=$(sha256sum "$tls_directory/fullchain.pem" "$tls_directory/privkey.pem" | sha256sum | cut -d ' ' -f 1)
+applied_hash_file=/run/generals-server/applied-certificate.sha256
+if [[ -s "$applied_hash_file" ]] && [[ "$(tr -d '[:space:]' <"$applied_hash_file")" == "$certificate_hash" ]]; then
+  exit 0
+fi
+
+# Status 10 asks generals-deploy to restart and record this pair only after
+# readiness succeeds. This makes a failed reload retryable on the next poll.
+exit 10

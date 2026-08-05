@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source /etc/generals-server/host.conf
+
+exec 9>/run/lock/generals-deploy.lock
+flock 9
+
+/usr/local/sbin/generals-verify-data-mount
+# EBS can grow in place; expand the mounted XFS filesystem before using any
+# newly provisioned capacity. This is safe and idempotent while mounted.
+xfs_growfs /srv/generals >/dev/null
+
+aws_region=$(printf '%s' "$AWS_REGION_B64" | base64 --decode)
+desired_image_parameter=$(printf '%s' "$DESIRED_IMAGE_PARAMETER_B64" | base64 --decode)
+expected_repository=$(printf '%s' "$ECR_REPOSITORY_URL_B64" | base64 --decode)
+hostname=$(printf '%s' "$HOSTNAME_B64" | base64 --decode)
+platform=$(printf '%s' "$GENERALS_PLATFORM_B64" | base64 --decode)
+log_group=$(printf '%s' "$CLOUDWATCH_LOG_GROUP_B64" | base64 --decode)
+
+desired_image=$(aws ssm get-parameter \
+  --region "$aws_region" \
+  --name "$desired_image_parameter" \
+  --query 'Parameter.Value' \
+  --output text)
+
+image_prefix="$expected_repository@sha256:"
+image_digest=${desired_image#"$image_prefix"}
+if [[ "$desired_image" != "$image_prefix$image_digest" || ! "$image_digest" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "desired image is not an immutable digest in the configured ECR repository" >&2
+  exit 1
+fi
+
+# Stage and verify a new immutable image before changing any live deployment
+# state. A failed pull must leave the currently running container untouched.
+image_platform=
+if docker image inspect "$desired_image" >/dev/null 2>&1; then
+  image_platform=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$desired_image")
+fi
+if [[ "$image_platform" != "$platform" ]]; then
+  docker pull --platform "$platform" "$desired_image"
+fi
+image_platform=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$desired_image")
+if [[ "$image_platform" != "$platform" ]]; then
+  echo "desired image platform is $image_platform, expected $platform" >&2
+  exit 1
+fi
+
+restart_required=false
+set +e
+/usr/local/sbin/generals-materialize-token
+token_status=$?
+set -e
+case "$token_status" in
+  0) ;;
+  10) restart_required=true ;;
+  *) exit "$token_status" ;;
+esac
+
+set +e
+/usr/local/sbin/generals-ensure-certificate
+certificate_status=$?
+set -e
+case "$certificate_status" in
+  0) ;;
+  10) restart_required=true ;;
+  *) exit "$certificate_status" ;;
+esac
+
+environment_file=/etc/generals-server/deployment.env
+temporary_file=$(mktemp /etc/generals-server/.deployment.env.XXXXXX)
+trap 'rm -f "$temporary_file"' EXIT
+cat >"$temporary_file" <<EOF
+AWS_REGION=$aws_region
+CLOUDWATCH_LOG_GROUP=$log_group
+GENERALS_IMAGE=$desired_image
+GENERALS_PLATFORM=$platform
+GENERALS_PUBLIC_HOST=$hostname
+EOF
+chmod 0600 "$temporary_file"
+
+if [[ ! -f "$environment_file" ]] || ! cmp --silent "$temporary_file" "$environment_file"; then
+  mv -f "$temporary_file" "$environment_file"
+  restart_required=true
+else
+  rm -f "$temporary_file"
+fi
+trap - EXIT
+
+if ! systemctl is-active --quiet generals-server.service; then
+  systemctl start generals-server.service
+elif [[ "$restart_required" == true ]]; then
+  systemctl restart generals-server.service
+else
+  docker compose \
+    --env-file "$environment_file" \
+    --file /opt/generals-server/compose.yaml \
+    up --detach --no-build --remove-orphans
+fi
+
+/usr/local/sbin/generals-readiness
+
+# Advance applied markers only after the selected image, token, and
+# certificate have all reached a ready container. A failed deployment leaves
+# the old marker in place so the next timer run retries the restart.
+token_hash=$(sha256sum /run/generals-server/admin-token | cut -d ' ' -f 1)
+certificate_hash=$(sha256sum /srv/generals/tls/fullchain.pem /srv/generals/tls/privkey.pem | sha256sum | cut -d ' ' -f 1)
+for marker in token certificate; do
+  marker_file="/run/generals-server/applied-$marker.sha256"
+  marker_value=$token_hash
+  if [[ "$marker" == certificate ]]; then
+    marker_value=$certificate_hash
+  fi
+  marker_temporary=$(mktemp "/run/generals-server/.applied-$marker.XXXXXX")
+  printf '%s\n' "$marker_value" >"$marker_temporary"
+  chmod 0600 "$marker_temporary"
+  mv -f "$marker_temporary" "$marker_file"
+done

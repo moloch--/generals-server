@@ -1,0 +1,59 @@
+name: generals-server-aws
+
+services:
+  generals-server:
+    image: ${GENERALS_IMAGE:?set GENERALS_IMAGE}
+    platform: ${GENERALS_PLATFORM:?set GENERALS_PLATFORM}
+    container_name: generals-server
+    user: "65532:65532"
+    restart: unless-stopped
+    stop_grace_period: 15s
+    read_only: true
+    command:
+      - --control-listen=:29900
+      - --relay-listen=:27901
+      - --health-listen=:8080
+      - --admin-listen=:8081
+      - --public-host=${GENERALS_PUBLIC_HOST:?set GENERALS_PUBLIC_HOST}
+      - --data-file=/data/profiles.db
+      - --tls-cert=/tls/fullchain.pem
+      - --tls-key=/tls/privkey.pem
+      - --admin-token-file=/run/secrets/admin-token
+    ports:
+      - "29900:29900/tcp"
+      - "27901:27901/udp"
+      - "127.0.0.1:8080:8080/tcp"
+      - "127.0.0.1:8081:8081/tcp"
+    volumes:
+      - type: bind
+        source: /srv/generals/data
+        target: /data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /srv/generals/tls
+        target: /tls
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /run/generals-server/admin-token
+        target: /run/secrets/admin-token
+        read_only: true
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWS_REGION:?set AWS_REGION}
+        awslogs-group: ${CLOUDWATCH_LOG_GROUP:?set CLOUDWATCH_LOG_GROUP}
+        awslogs-stream: generals-server
+        mode: non-blocking
+        max-buffer-size: 4m
+

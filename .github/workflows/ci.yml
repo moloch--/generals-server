@@ -45,3 +45,52 @@ jobs:
 
       - name: Build container
         run: docker build --tag generals-server:test .
+
+  infrastructure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.15.8
+
+      - name: Verify Terraform formatting
+        run: terraform fmt -check -recursive deployments/aws
+
+      - name: Validate bootstrap stack
+        run: |
+          terraform -chdir=deployments/aws/bootstrap init -backend=false -input=false
+          terraform -chdir=deployments/aws/bootstrap validate
+
+      - name: Validate deployment stack
+        run: |
+          terraform -chdir=deployments/aws/terraform init -backend=false -input=false
+          terraform -chdir=deployments/aws/terraform validate
+
+      - name: Test infrastructure plans offline
+        run: |
+          terraform -chdir=deployments/aws/bootstrap test
+          terraform -chdir=deployments/aws/terraform test
+
+      - name: Check host scripts
+        run: |
+          for script in deployments/aws/runtime/generals-*; do
+            case "$script" in
+              *.service|*.timer) continue ;;
+            esac
+            bash -n "$script"
+          done
+          bash -n deployments/aws/terraform/templates/user-data.sh.tftpl
+
+      - name: Render AWS Compose definition
+        env:
+          AWS_REGION: us-west-2
+          CLOUDWATCH_LOG_GROUP: /generals-server/test/server
+          GENERALS_IMAGE: 123456789012.dkr.ecr.us-west-2.amazonaws.com/generals-server@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+          GENERALS_PLATFORM: linux/arm64
+          GENERALS_PUBLIC_HOST: online.example.net
+        run: docker compose -f deployments/aws/runtime/compose.yaml config --quiet

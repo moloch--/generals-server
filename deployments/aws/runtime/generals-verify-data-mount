@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mountpoint --quiet /srv/generals
+
+expected_uuid=$(tr -d '[:space:]' </etc/generals-server/data-volume-uuid)
+[[ -n "$expected_uuid" ]]
+
+mounted_source=$(findmnt --noheadings --output SOURCE /srv/generals)
+mounted_uuid=$(blkid -s UUID -o value "$mounted_source")
+[[ "$mounted_uuid" == "$expected_uuid" ]]
+
+expected_device=$(/usr/local/sbin/generals-find-data-device)
+[[ "$(readlink -f "$mounted_source")" == "$(readlink -f "$expected_device")" ]]
+

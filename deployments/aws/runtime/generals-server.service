@@ -1,0 +1,28 @@
+[Unit]
+Description=GeneralsX Online server container
+After=docker.service network-online.target
+Requires=docker.service
+PartOf=docker.service
+RequiresMountsFor=/srv/generals
+ConditionPathExists=/etc/generals-server/deployment.env
+ConditionPathExists=/run/generals-server/admin-token
+ConditionPathExists=/srv/generals/tls/fullchain.pem
+ConditionPathExists=/srv/generals/tls/privkey.pem
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/generals-server
+EnvironmentFile=/etc/generals-server/deployment.env
+ExecStartPre=/usr/local/sbin/generals-verify-data-mount
+ExecStartPre=/usr/bin/docker compose --env-file /etc/generals-server/deployment.env --file /opt/generals-server/compose.yaml config --quiet
+ExecStartPre=/usr/bin/docker image inspect ${GENERALS_IMAGE}
+ExecStart=/usr/bin/docker compose --env-file /etc/generals-server/deployment.env --file /opt/generals-server/compose.yaml up --detach --no-build --remove-orphans
+ExecStartPost=/usr/local/sbin/generals-readiness
+ExecReload=/usr/bin/docker restart --time 15 generals-server
+ExecStop=-/usr/bin/docker compose --env-file /etc/generals-server/deployment.env --file /opt/generals-server/compose.yaml stop --timeout 15
+TimeoutStartSec=5min
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=multi-user.target

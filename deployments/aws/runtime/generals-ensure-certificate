@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source /etc/generals-server/host.conf
+
+hostname=$(printf '%s' "$HOSTNAME_B64" | base64 --decode)
+email=$(printf '%s' "$ACME_EMAIL_B64" | base64 --decode)
+lineage_directory="/srv/generals/letsencrypt/live/$hostname"
+renewal_configuration="/srv/generals/letsencrypt/renewal/$hostname.conf"
+
+certificate_is_usable() {
+  local certificate="$lineage_directory/fullchain.pem"
+  local private_key="$lineage_directory/privkey.pem"
+  local certificate_public_key
+  local private_public_key
+
+  [[ -s "$certificate" && -s "$private_key" ]] || return 1
+  openssl x509 -in "$certificate" -noout -checkhost "$hostname" >/dev/null 2>&1 || return 1
+  openssl x509 -in "$certificate" -noout -checkend 604800 >/dev/null 2>&1 || return 1
+  certificate_public_key=$(openssl x509 -in "$certificate" -pubkey -noout | sha256sum | cut -d ' ' -f 1) || return 1
+  private_public_key=$(openssl pkey -in "$private_key" -pubout | sha256sum | cut -d ' ' -f 1) || return 1
+  [[ "$certificate_public_key" == "$private_public_key" ]]
+}
+
+exec 8>/run/lock/generals-certbot.lock
+flock 8
+
+if ! certificate_is_usable; then
+  certbot_arguments=(
+    certonly
+    --config-dir /srv/generals/letsencrypt
+    --work-dir /srv/generals/letsencrypt-work
+    --logs-dir /var/log/letsencrypt
+    --cert-name "$hostname"
+    --domain "$hostname"
+    --dns-route53
+    --non-interactive
+    --agree-tos
+    --email "$email"
+  )
+  if [[ -f "$renewal_configuration" ]]; then
+    certbot_arguments+=(--force-renewal)
+  fi
+  certbot "${certbot_arguments[@]}"
+fi
+
+if ! certificate_is_usable; then
+  echo "ACME lineage is missing a valid hostname-matched certificate and private key" >&2
+  exit 1
+fi
+
+/usr/local/sbin/generals-copy-certificate

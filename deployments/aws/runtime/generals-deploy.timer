@@ -1,0 +1,13 @@
+[Unit]
+Description=Poll the desired GeneralsX Online image and token
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+Persistent=true
+Unit=generals-deploy.service
+
+[Install]
+WantedBy=timers.target
+

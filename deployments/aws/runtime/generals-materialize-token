@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export LC_ALL=C
+
+source /etc/generals-server/host.conf
+
+aws_region=$(printf '%s' "$AWS_REGION_B64" | base64 --decode)
+parameter_name=$(printf '%s' "$ADMIN_TOKEN_PARAMETER_B64" | base64 --decode)
+
+install -d -m 0700 -o root -g root /run/generals-server
+temporary_file=$(mktemp /run/generals-server/.admin-token.XXXXXX)
+trap 'rm -f "$temporary_file"' EXIT
+
+token=$(aws ssm get-parameter \
+  --region "$aws_region" \
+  --name "$parameter_name" \
+  --with-decryption \
+  --query 'Parameter.Value' \
+  --output text)
+
+if (( ${#token} < 32 || ${#token} > 4096 )); then
+  echo "admin token must contain between 32 and 4096 bytes" >&2
+  exit 1
+fi
+if [[ "$token" =~ [^!-~] ]]; then
+  echo "admin token must contain printable non-whitespace ASCII only" >&2
+  exit 1
+fi
+
+printf '%s' "$token" >"$temporary_file"
+chown 65532:65532 "$temporary_file"
+chmod 0600 "$temporary_file"
+
+if [[ ! -f /run/generals-server/admin-token ]] || ! cmp --silent "$temporary_file" /run/generals-server/admin-token; then
+  mv -f "$temporary_file" /run/generals-server/admin-token
+  trap - EXIT
+fi
+
+token_hash=$(sha256sum /run/generals-server/admin-token | cut -d ' ' -f 1)
+applied_hash_file=/run/generals-server/applied-token.sha256
+if [[ -s "$applied_hash_file" ]] && [[ "$(tr -d '[:space:]' <"$applied_hash_file")" == "$token_hash" ]]; then
+  exit 0
+fi
+
+# Status 10 means the desired token is safely materialized but has not yet
+# been proven active by a successful container restart and readiness check.
+exit 10

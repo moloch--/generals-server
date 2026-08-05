@@ -1,0 +1,12 @@
+[Unit]
+Description=Reconcile the desired GeneralsX Online container
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+RequiresMountsFor=/srv/generals
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/generals-deploy
+TimeoutStartSec=10min
+

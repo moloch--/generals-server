@@ -1,0 +1,11 @@
+[Unit]
+Description=Renew the GeneralsX Online ACME certificate
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/srv/generals
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/flock /run/lock/generals-certbot.lock /usr/bin/certbot renew --config-dir /srv/generals/letsencrypt --work-dir /srv/generals/letsencrypt-work --logs-dir /var/log/letsencrypt --non-interactive --quiet
+ExecStart=/usr/local/sbin/generals-deploy
+TimeoutStartSec=20min

@@ -93,6 +93,12 @@ The supplied [Compose file](compose.yaml) is the recommended deployment. It
 publishes gameplay ports publicly, binds health/metrics to host loopback, and
 binds the admin service only to one exact private IPv4 address.
 
+For a cost-conscious AWS installation, the
+[Terraform deployment](deployments/aws/README.md) provisions one containerized
+EC2 host with an Elastic IP, retained encrypted EBS storage, Route 53 DNS,
+DNS-validated ACME TLS, and SSM-only administration. It deliberately omits a
+load balancer, NAT Gateway, multi-AZ replicas, and application backups.
+
 ### 1. Create private host paths
 
 From the repository root:

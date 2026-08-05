@@ -10,3 +10,10 @@
 /admin-token
 /web/.heroui/
 /web/node_modules/
+**/.terraform/*
+*.tfplan
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.auto.tfvars
+!*.tfvars.example

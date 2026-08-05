@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source /etc/generals-server/host.conf
+
+expected_volume_id=$(printf '%s' "$DATA_VOLUME_ID_B64" | base64 --decode)
+expected_serial=${expected_volume_id//-/}
+
+while read -r device serial; do
+  normalized_serial=${serial//-/}
+  if [[ "$normalized_serial" == "$expected_serial" ]]; then
+    printf '%s\n' "$device"
+    exit 0
+  fi
+done < <(lsblk --nodeps --noheadings --output PATH,SERIAL)
+
+exit 1
+
