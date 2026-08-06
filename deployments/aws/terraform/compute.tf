@@ -1,5 +1,9 @@
 locals {
   compose_version = "5.4.0"
+  admin_is_public = length(var.allowed_admin_ipv4_cidrs) > 0
+  admin_bind_host = local.admin_is_public ? "0.0.0.0" : "127.0.0.1"
+  admin_tls_cert  = local.admin_is_public ? "/tls/fullchain.pem" : ""
+  admin_tls_key   = local.admin_is_public ? "/tls/privkey.pem" : ""
   compose_sha256 = {
     aarch64 = "fc5d1371f1ec7987e703da94ede49af3fbfb240b83f22991a98511de7bc4b93b"
     x86_64  = "837fd1d35bf6a494f41b5b5988269a7be79de337cf1a1a6ff0e45ab51bb4e9be"
@@ -12,7 +16,11 @@ locals {
     desired_image_parameter_b64 = base64encode(aws_ssm_parameter.desired_image.name)
     ecr_repository_url_b64      = base64encode(data.aws_ecr_repository.server.repository_url)
     hostname_b64                = base64encode(var.hostname)
+    public_hostname_b64         = base64encode(var.public_hostname)
     acme_email_b64              = base64encode(var.acme_email)
+    admin_bind_host_b64         = base64encode(local.admin_bind_host)
+    admin_tls_cert_b64          = base64encode(local.admin_tls_cert)
+    admin_tls_key_b64           = base64encode(local.admin_tls_key)
     generals_platform_b64       = base64encode(local.deployment_platform)
     cloudwatch_log_group_b64    = base64encode(aws_cloudwatch_log_group.server.name)
   })
@@ -116,7 +124,9 @@ resource "aws_instance" "server" {
     # A new public AMI should be adopted only during a deliberate host replacement.
     # Likewise, changing embedded bootstrap files must not stop an active host
     # for an EC2 user-data update that cloud-init would not execute again.
-    ignore_changes = [ami, user_data_base64]
+    # The provider reports public-IP association after the separately managed EIP
+    # is attached, even though launch-time and subnet auto-assignment stay disabled.
+    ignore_changes = [ami, associate_public_ip_address, user_data_base64]
     replace_triggered_by = [
       terraform_data.host_configuration,
     ]

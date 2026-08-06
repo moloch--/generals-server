@@ -17,12 +17,19 @@ services:
       - --tls-key=/tls/privkey.pem
       - --admin-listen=:8081
       - --admin-token-file=/run/secrets/admin-token
-      - --public-web-listen=:8082
+      - --admin-tls-cert=${GENERALS_ADMIN_TLS_CERT:-}
+      - --admin-tls-key=${GENERALS_ADMIN_TLS_KEY:-}
+      - --public-web-listen=:8443
+      - --public-web-tls-cert=/tls/fullchain.pem
+      - --public-web-tls-key=/tls/privkey.pem
+      - --public-web-redirect-listen=:8083
+      - --public-web-canonical-host=${GENERALS_PUBLIC_HOST:?set GENERALS_PUBLIC_HOST}
     ports:
       - "29900:29900/tcp"
       - "27901:27901/udp"
       - "127.0.0.1:8080:8080/tcp"
-      - "8082:8082/tcp"
+      - "443:8443/tcp"
+      - "80:8083/tcp"
       - target: 8081
         published: "8081"
         protocol: tcp

@@ -1,8 +1,8 @@
 @import "tailwindcss";
 @import "@heroui/styles";
-@import "@heroui-pro/react/css";
 
 @source "./**/*.{ts,tsx}";
+@source "../components/*.{ts,tsx}";
 
 :root {
   color-scheme: dark;

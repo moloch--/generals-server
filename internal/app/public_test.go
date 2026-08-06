@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"io"
 	"io/fs"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -79,6 +81,9 @@ func TestPublicSnapshotUsesExplicitRedactedDTOs(t *testing.T) {
 	}
 	if response.Header().Get("Access-Control-Allow-Origin") != "" {
 		t.Fatalf("public API unexpectedly enabled CORS: %q", response.Header().Get("Access-Control-Allow-Origin"))
+	}
+	if response.Header().Get("Strict-Transport-Security") != "" {
+		t.Fatal("HTTP public response unexpectedly enabled HSTS")
 	}
 	for _, header := range []string{
 		"Content-Security-Policy", "Cross-Origin-Opener-Policy", "Cross-Origin-Resource-Policy",
@@ -157,6 +162,8 @@ func TestPublicHandlerStrictRouteAllowlist(t *testing.T) {
 		{http.MethodGet, "/api/public/v1/unknown"},
 		{http.MethodGet, "/not-a-public-route"},
 		{http.MethodGet, "/assets/not-found.js"},
+		{http.MethodGet, "/assets/../admin/"},
+		{http.MethodGet, "/assets/%2e%2e/api/admin/v1/overview"},
 	} {
 		request := httptest.NewRequest(test.method, "http://public.test"+test.path, nil)
 		request.Header.Set("Authorization", "Bearer "+testAdminToken)
@@ -164,6 +171,9 @@ func TestPublicHandlerStrictRouteAllowlist(t *testing.T) {
 		handler.ServeHTTP(response, request)
 		if response.Code != http.StatusNotFound {
 			t.Errorf("%s %s status=%d, want 404; body=%q", test.method, test.path, response.Code, response.Body.String())
+		}
+		if location := response.Header().Get("Location"); location != "" {
+			t.Errorf("%s %s unexpectedly redirected to %q", test.method, test.path, location)
 		}
 	}
 
@@ -198,11 +208,88 @@ func TestPublicHandlerStrictRouteAllowlist(t *testing.T) {
 	if index.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("public index cache control = %q", index.Header().Get("Cache-Control"))
 	}
-	for _, route := range []string{"/leaderboard", "/game-lobbies", "/online-players", "/active-games"} {
+	for _, route := range []string{"/leaderboard", "/game-lobbies", "/online-players", "/active-games", "/how-to-play"} {
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "http://public.test"+route, nil))
 		if response.Code != http.StatusOK || !strings.Contains(response.Header().Get("Content-Type"), "text/html") {
 			t.Errorf("approved public route %s status=%d type=%q", route, response.Code, response.Header().Get("Content-Type"))
+		}
+	}
+}
+
+func TestPublicWebRedirectPreservesCanonicalHostPathAndQuery(t *testing.T) {
+	handler := newPublicWebRedirectHandler("generals.network")
+	assetEntries, err := fs.ReadDir(testPublicHandler(publicActivitySnapshot{}, &stubPublicLeaderboardReader{}).assets, "assets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	embeddedAssetPath := ""
+	for _, entry := range assetEntries {
+		if !entry.IsDir() {
+			embeddedAssetPath = "/assets/" + entry.Name()
+			break
+		}
+	}
+	if embeddedAssetPath == "" {
+		t.Fatal("embedded public assets directory contains no files")
+	}
+	for _, test := range []struct {
+		method string
+		target string
+		want   string
+	}{
+		{http.MethodGet, "http://attacker.example/", "https://generals.network/"},
+		{http.MethodGet, "http://attacker.example/leaderboard?season=all&player=Alice%20Bob", "https://generals.network/leaderboard?season=all&player=Alice%20Bob"},
+		{http.MethodGet, "http://attacker.example/how-to-play?source=nav", "https://generals.network/how-to-play?source=nav"},
+		{http.MethodHead, "http://attacker.example" + embeddedAssetPath + "?cache=a%2Fb", "https://generals.network" + embeddedAssetPath + "?cache=a%2Fb"},
+		{http.MethodGet, "http://attacker.example/generalsx%2Dzh-icon.png?cache=icon", "https://generals.network/generalsx%2Dzh-icon.png?cache=icon"},
+		{http.MethodGet, "http://attacker.example/api/public/v1/snapshot?source=http%3A%2F%2Fevil.example", "https://generals.network/api/public/v1/snapshot?source=http%3A%2F%2Fevil.example"},
+	} {
+		request := httptest.NewRequest(test.method, test.target, nil)
+		request.Host = "poisoned.example:8083"
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusPermanentRedirect {
+			t.Errorf("%s %s status=%d, want 308", test.method, test.target, response.Code)
+		}
+		if got := response.Header().Get("Location"); got != test.want {
+			t.Errorf("%s %s Location=%q, want %q", test.method, test.target, got, test.want)
+		}
+	}
+}
+
+func TestPublicWebRedirectRejectsPrivateUnknownAndNoncanonicalRoutes(t *testing.T) {
+	handler := newPublicWebRedirectHandler("generals.network")
+	for _, test := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/admin"},
+		{http.MethodGet, "/admin/"},
+		{http.MethodGet, "/api/admin"},
+		{http.MethodGet, "/api/admin/v1/overview?redirect=true"},
+		{http.MethodGet, "/%61dmin/"},
+		{http.MethodGet, "/assets/../admin/"},
+		{http.MethodGet, "/assets/%2e%2e/api/admin/v1/overview"},
+		{http.MethodGet, "/healthz"},
+		{http.MethodGet, "/readyz"},
+		{http.MethodGet, "/metrics"},
+		{http.MethodGet, "/unknown"},
+		{http.MethodGet, "/how-to-play/"},
+		{http.MethodGet, "/assets/"},
+		{http.MethodGet, "/assets/not-found.js"},
+		{http.MethodGet, "/assets/admin/secret.js"},
+		{http.MethodPost, "/leaderboard"},
+	} {
+		request := httptest.NewRequest(test.method, "http://public.test"+test.path, nil)
+		request.Header.Set("Authorization", "Bearer "+testAdminToken)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusNotFound {
+			t.Errorf("%s %s status=%d, want 404", test.method, test.path, response.Code)
+		}
+		if location := response.Header().Get("Location"); location != "" {
+			t.Errorf("%s %s unexpectedly redirected to %q", test.method, test.path, location)
 		}
 	}
 }
@@ -406,6 +493,178 @@ func TestHubPublicActivitySnapshotRedactsAndClassifiesState(t *testing.T) {
 	}
 }
 
+func TestServerPublicWebTLSRedirectLifecycleAndIsolation(t *testing.T) {
+	certFile, keyFile, roots := writeTestTLSCertificate(t)
+	cfg := DefaultConfig()
+	cfg.ControlAddr = "127.0.0.1:0"
+	cfg.RelayAddr = "127.0.0.1:0"
+	cfg.HealthAddr = "127.0.0.1:0"
+	cfg.PublicWebAddr = "127.0.0.1:0"
+	cfg.PublicWebTLSCertFile = certFile
+	cfg.PublicWebTLSKeyFile = keyFile
+	cfg.PublicWebRedirectAddr = "127.0.0.1:0"
+	cfg.PublicWebCanonicalHost = "generals.network"
+	cfg.AdminAddr = "127.0.0.1:0"
+	cfg.AdminTokenFile = writeTestAdminToken(t)
+	cfg.AdminTLSCertFile = certFile
+	cfg.AdminTLSKeyFile = keyFile
+	cfg.PublicHost = "127.0.0.1"
+	cfg.DataFile = ""
+	server, err := NewServer(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			t.Errorf("shutdown: %v", err)
+		}
+	}()
+
+	addresses := map[string]string{
+		"health":   server.HealthAddress(),
+		"public":   server.PublicWebAddress(),
+		"redirect": server.PublicWebRedirectAddress(),
+		"admin":    server.AdminAddress(),
+	}
+	ports := make(map[string]string, len(addresses))
+	for name, address := range addresses {
+		_, port, err := net.SplitHostPort(address)
+		if err != nil {
+			t.Fatalf("%s address %q: %v", name, address, err)
+		}
+		if previous, exists := ports[port]; exists {
+			t.Fatalf("%s and %s resolved to the same TCP port %s", previous, name, port)
+		}
+		ports[port] = name
+	}
+
+	transport := &http.Transport{TLSClientConfig: &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		MaxVersion: tls.VersionTLS12,
+		RootCAs:    roots,
+		ServerName: "127.0.0.1",
+	}}
+	defer transport.CloseIdleConnections()
+	httpsClient := &http.Client{Transport: transport, Timeout: 2 * time.Second}
+
+	publicResponse, err := httpsClient.Get("https://" + server.PublicWebAddress() + "/api/public/v1/snapshot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicResponse.Body.Close()
+	if publicResponse.StatusCode != http.StatusOK || publicResponse.TLS == nil || publicResponse.TLS.Version != tls.VersionTLS12 {
+		t.Fatalf("public HTTPS response status=%s TLS=%#v", publicResponse.Status, publicResponse.TLS)
+	}
+	if got := publicResponse.Header.Get("Strict-Transport-Security"); got != "max-age=31536000" {
+		t.Fatalf("public Strict-Transport-Security = %q", got)
+	}
+	legacyTransport := &http.Transport{TLSClientConfig: &tls.Config{
+		MinVersion: tls.VersionTLS10,
+		MaxVersion: tls.VersionTLS11,
+		RootCAs:    roots,
+		ServerName: "127.0.0.1",
+	}}
+	defer legacyTransport.CloseIdleConnections()
+	legacyResponse, legacyErr := (&http.Client{Transport: legacyTransport, Timeout: 2 * time.Second}).Get(
+		"https://" + server.PublicWebAddress() + "/",
+	)
+	if legacyErr == nil {
+		legacyResponse.Body.Close()
+		t.Fatalf("public TLS listener accepted legacy TLS version %x", legacyResponse.TLS.Version)
+	}
+
+	for _, requestTarget := range []string{"/admin/", "/api/admin/v1/overview", "/healthz"} {
+		request, err := http.NewRequest(http.MethodGet, "https://"+server.PublicWebAddress()+requestTarget, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Authorization", "Bearer "+testAdminToken)
+		response, err := httpsClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusNotFound {
+			t.Errorf("public HTTPS %s status=%s, want 404", requestTarget, response.Status)
+		}
+	}
+
+	adminRequest, err := http.NewRequest(http.MethodGet, "https://"+server.AdminAddress()+"/api/public/v1/snapshot", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminRequest.Header.Set("Authorization", "Bearer "+testAdminToken)
+	adminResponse, err := httpsClient.Do(adminRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminResponse.Body.Close()
+	if adminResponse.StatusCode != http.StatusNotFound {
+		t.Fatalf("admin HTTPS exposed public snapshot: status=%s", adminResponse.Status)
+	}
+
+	plaintextResponse, plaintextErr := (&http.Client{Timeout: 2 * time.Second}).Get("http://" + server.PublicWebAddress() + "/")
+	if plaintextErr == nil {
+		plaintextResponse.Body.Close()
+		if plaintextResponse.StatusCode == http.StatusOK || plaintextResponse.StatusCode == http.StatusPermanentRedirect {
+			t.Fatalf("TLS public listener accepted plaintext: status=%s", plaintextResponse.Status)
+		}
+	}
+
+	redirectClient := &http.Client{
+		Timeout:       2 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	redirectRequest, err := http.NewRequest(http.MethodGet,
+		"http://"+server.PublicWebRedirectAddress()+"/leaderboard?season=all%2Btime", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	redirectRequest.Host = "attacker.example"
+	redirectResponse, err := redirectClient.Do(redirectRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	redirectResponse.Body.Close()
+	if redirectResponse.StatusCode != http.StatusPermanentRedirect ||
+		redirectResponse.Header.Get("Location") != "https://generals.network/leaderboard?season=all%2Btime" {
+		t.Fatalf("live redirect status=%s Location=%q", redirectResponse.Status, redirectResponse.Header.Get("Location"))
+	}
+
+	privateRedirectRequest, err := http.NewRequest(http.MethodGet,
+		"http://"+server.PublicWebRedirectAddress()+"/api/admin/v1/overview", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateRedirectRequest.Header.Set("Authorization", "Bearer "+testAdminToken)
+	privateRedirectResponse, err := redirectClient.Do(privateRedirectRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateRedirectResponse.Body.Close()
+	if privateRedirectResponse.StatusCode != http.StatusNotFound || privateRedirectResponse.Header.Get("Location") != "" {
+		t.Fatalf("admin redirect isolation status=%s Location=%q", privateRedirectResponse.Status, privateRedirectResponse.Header.Get("Location"))
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		t.Fatal(err)
+	}
+	for name, address := range map[string]string{
+		"public": server.PublicWebAddress(), "redirect": server.PublicWebRedirectAddress(), "admin": server.AdminAddress(),
+	} {
+		if _, err := net.DialTimeout("tcp", address, 200*time.Millisecond); err == nil {
+			t.Errorf("%s listener remained open after shutdown", name)
+		}
+	}
+}
+
 func TestServerPublicWebLifecycleAndPortIsolation(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.ControlAddr = "127.0.0.1:0"
@@ -562,6 +821,90 @@ func TestServerPublicWebBindAndRuntimeFailuresCleanUp(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for public web listener error")
+	}
+	shutdownContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownContext); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestServerPublicWebTLSCertificateLoadFailureClosesStore(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.PublicWebAddr = "127.0.0.1:0"
+	cfg.PublicWebTLSCertFile = filepath.Join(t.TempDir(), "missing-cert.pem")
+	cfg.PublicWebTLSKeyFile = filepath.Join(t.TempDir(), "missing-key.pem")
+	cfg.DataFile = ""
+	server, err := NewServer(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "load public web TLS certificate") {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if err := server.store.db.Ping(); err == nil {
+		t.Fatal("profile store remained open after public TLS certificate load failure")
+	}
+	if err := server.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown after public TLS certificate load failure: %v", err)
+	}
+}
+
+func TestServerPublicWebRedirectBindAndRuntimeFailuresCleanUp(t *testing.T) {
+	certFile, keyFile, _ := writeTestTLSCertificate(t)
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+
+	failedConfig := DefaultConfig()
+	failedConfig.ControlAddr = "127.0.0.1:0"
+	failedConfig.RelayAddr = "127.0.0.1:0"
+	failedConfig.HealthAddr = "127.0.0.1:0"
+	failedConfig.PublicWebAddr = "127.0.0.1:0"
+	failedConfig.PublicWebTLSCertFile = certFile
+	failedConfig.PublicWebTLSKeyFile = keyFile
+	failedConfig.PublicWebRedirectAddr = occupied.Addr().String()
+	failedConfig.PublicWebCanonicalHost = "generals.network"
+	failedConfig.PublicHost = "127.0.0.1"
+	failedConfig.DataFile = ""
+	failed, err := NewServer(failedConfig, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := failed.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "listen for public web redirect requests") {
+		t.Fatalf("redirect bind error = %v", err)
+	}
+	if _, err := net.DialTimeout("tcp", failed.PublicWebAddress(), 200*time.Millisecond); err == nil {
+		t.Fatal("public web listener remained open after redirect bind failure")
+	}
+	if err := failed.store.db.Ping(); err == nil {
+		t.Fatal("profile store remained open after redirect bind failure")
+	}
+	if err := failed.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown after redirect bind failure: %v", err)
+	}
+
+	runtimeConfig := failedConfig
+	runtimeConfig.PublicWebRedirectAddr = "127.0.0.1:0"
+	server, err := NewServer(runtimeConfig, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.publicWebRedirectLn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-server.Errors():
+		if err == nil || !strings.Contains(err.Error(), "serve public web redirect requests") {
+			t.Fatalf("runtime error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for public web redirect listener error")
 	}
 	shutdownContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

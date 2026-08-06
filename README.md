@@ -52,9 +52,10 @@ For the supplied production deployment:
 
 - Docker Engine with Docker Compose v2;
 - a player-resolvable DNS name or public IPv4 address;
-- a TLS certificate and private key for the control listener;
-- inbound TCP `29900`, UDP `27901`, and public web TCP `8082` forwarded to the
-  same host;
+- a TLS certificate and private key covering the public hostname for the
+  control listener and website;
+- inbound TCP `29900`, UDP `27901`, HTTPS TCP `443`, and redirect TCP `80`
+  forwarded to the same host;
 - Tailscale, or an equivalent private management network, for the admin UI.
 
 ## Local quick start
@@ -77,6 +78,9 @@ curl -fsS http://127.0.0.1:8080/readyz
 curl -fsS http://127.0.0.1:8082/api/public/v1/snapshot
 ```
 
+This loopback-only `8082` listener is a plaintext development convenience. The
+production mappings below do not publish host TCP `8082`.
+
 Start the game with this endpoint (`--onlineServer` is also accepted):
 
 ```text
@@ -97,7 +101,9 @@ The default SQLite database is `data/profiles.db`. Override it with
 The supplied [Compose file](compose.yaml) is the recommended deployment. It
 publishes gameplay ports publicly, binds health/metrics to host loopback, and
 binds the admin service only to one exact private IPv4 address. The read-only
-public website is published separately on TCP `8082`.
+public website terminates TLS independently on container TCP `8443`, published
+as host TCP `443`; a minimal listener on container TCP `8083`, published as
+host TCP `80`, redirects only recognized public routes to HTTPS.
 
 For a cost-conscious AWS installation, the
 [Terraform deployment](deployments/aws/README.md) provisions one containerized
@@ -139,6 +145,7 @@ Edit `.env` and replace every example value:
 | `GENERALS_TLS_DIR` | Existing absolute directory containing `fullchain.pem` and `privkey.pem` |
 | `GENERALS_ADMIN_HOST` | Exact Tailscale/private IPv4 address; never `0.0.0.0` |
 | `GENERALS_ADMIN_TOKEN_FILE` | Existing absolute path to the mode-`0600` token file |
+| `GENERALS_ADMIN_TLS_CERT` / `GENERALS_ADMIN_TLS_KEY` | Optional paired container paths for HTTPS admin, normally `/tls/fullchain.pem` and `/tls/privkey.pem` |
 | `GENERALS_UID` / `GENERALS_GID` | Numeric owner IDs for the bind-mounted files |
 | `GENERALS_IMAGE` | Image name; defaults to `generals-server:local` |
 | `GENERALS_BUILD_CONTEXT` | Docker build context; defaults to `.` |
@@ -156,8 +163,9 @@ install -m 0600 /secure/source/fullchain.pem "$PWD/tls/fullchain.pem"
 install -m 0600 /secure/source/privkey.pem "$PWD/tls/privkey.pem"
 ```
 
-Both files are required. The server accepts TLS 1.2 or newer, and the
-certificate name must match the hostname players use. The operations guide
+Both files are required. The control and public website listeners accept TLS
+1.2 or newer, and the certificate name must match the hostname players and web
+browsers use. The operations guide
 also documents the optional
 [Certbot issuance and renewal flow](docs/OPERATIONS.md#container-deployment).
 
@@ -168,7 +176,7 @@ docker compose config --quiet
 docker compose up --build -d
 docker compose ps
 curl -fsS http://127.0.0.1:8080/readyz
-curl -fsS http://127.0.0.1:8082/api/public/v1/snapshot
+curl -fsS https://online.example.net/api/public/v1/snapshot
 ```
 
 Follow logs with:
@@ -183,38 +191,45 @@ docker compose logs -f
 |---|---|---|
 | TCP `29900` | Public | TLS control, authentication, chat, and matchmaking |
 | UDP `27901` | Public | Authenticated game-packet relay |
+| TCP `80` -> container `8083` | Public | Strict HTTP-to-HTTPS redirects for recognized public routes |
+| TCP `443` -> container `8443` | Public | TLS read-only website and public snapshot API |
 | TCP `8080` | Loopback or private monitoring only | Health, readiness, and Prometheus metrics |
-| TCP `8081` | Exact Tailscale/private address only | Admin REST API, dashboard, and WebSocket stream |
-| TCP `8082` | Public | Read-only website and public snapshot API |
+| TCP `8081` | Exact private address, or HTTPS from exact allowlisted operator hosts | Admin REST API, dashboard, and WebSocket stream |
 
 If NAT maps a different external UDP port to local UDP `27901`, set that
-external port with `--public-relay-port`. Do not publish TCP `8080` or `8081`
-on the public firewall.
+external port with `--public-relay-port`. Never expose TCP `8080` or a raw
+public-web origin such as `8082`. Expose TCP `8081` only with admin TLS and a
+firewall restricted to exact operator `/32` addresses.
 
 ## Browse the public website
 
 Open the read-only public interface at:
 
 ```text
-http://online.example.net:8082/
+https://online.example.net/
 ```
 
-TCP `8082` is a plaintext origin HTTP listener. For an Internet-facing website,
-terminate HTTPS on a reverse proxy (normally TCP `443`) and forward only the
-public origin traffic to TCP `8082`; do not route admin TCP `8081` through that
-public proxy. The direct `:8082` URL is appropriate for local access and origin
-smoke tests.
+The production Compose mapping sends host TCP `443` directly to the public TLS
+listener on container TCP `8443`. Host TCP `80` reaches a separate minimal
+listener on container TCP `8083`; it redirects GET and HEAD requests for known
+public routes to the canonical HTTPS hostname while preserving path and query.
+Unknown, noncanonical, health, metrics, and admin paths return not found rather
+than redirecting. Container ports `8443` and `8083` are not published as
+additional host origin ports.
 
-It presents service status, the leaderboard, online players, joinable lobbies,
-and active games from the same process that owns the live Online state. Its only
+It is a client-side routed application with separate overview, leaderboard,
+game-lobby, online-player, active-game, and How to play pages. Live activity
+comes from the same process that owns the Online state; installation guidance
+links to the official Automated Build Tool releases and documentation. Its only
 JSON endpoint is `GET /api/public/v1/snapshot`; all returned collections are
 bounded and contain public display data rather than account usernames or admin
 controls.
 
 The public listener is disabled unless `--public-web-listen` is set. It runs on
-an independent HTTP server and route table: `/admin/` and every
-`/api/admin/v1/*` path are unavailable on TCP `8082`, even when a request sends
-an admin bearer token. Keep TCP `8081` on the private management network.
+an independent server and route table: `/admin/` and every `/api/admin/v1/*`
+path are unavailable through both public ports, even when a request sends an
+admin bearer token. Keep TCP `8081` on the private management network or behind
+TLS and an exact operator-IP allowlist.
 
 ## Connect players
 
@@ -269,6 +284,14 @@ private address:
 --admin-token-file /etc/generals-server/admin-token
 ```
 
+Admin TLS is independently opt-in. Set both `--admin-tls-cert` and
+`--admin-tls-key`, and use a certificate whose DNS name matches the admin URL.
+The Compose variables `GENERALS_ADMIN_TLS_CERT` and
+`GENERALS_ADMIN_TLS_KEY` pass those paths through without sharing the public
+handler or route table. Direct Internet access additionally requires a host
+firewall restricted to exact operator `/32` addresses; bearer authentication
+alone is not an exposure boundary.
+
 ## Monitor and operate
 
 The private operations listener exposes:
@@ -295,7 +318,7 @@ docker compose build --pull
 docker compose up -d
 docker compose ps
 curl -fsS http://127.0.0.1:8080/readyz
-curl -fsS http://127.0.0.1:8082/api/public/v1/snapshot
+curl -fsS https://online.example.net/api/public/v1/snapshot
 ```
 
 Schedule restarts outside active matches. Profiles and stats remain in SQLite,
@@ -321,7 +344,11 @@ CGO_ENABLED=0 go build -trimpath \
   --control-listen :29900 \
   --relay-listen :27901 \
   --health-listen 127.0.0.1:8080 \
-  --public-web-listen :8082 \
+  --public-web-listen :8443 \
+  --public-web-tls-cert /etc/generals-server/tls/fullchain.pem \
+  --public-web-tls-key /etc/generals-server/tls/privkey.pem \
+  --public-web-redirect-listen :8083 \
+  --public-web-canonical-host online.example.net \
   --public-host online.example.net \
   --tls-cert /etc/generals-server/tls/fullchain.pem \
   --tls-key /etc/generals-server/tls/privkey.pem \
@@ -331,11 +358,20 @@ CGO_ENABLED=0 go build -trimpath \
 The supplied [systemd unit](deployments/generals-server.service) and its
 installation steps are documented in the
 [operations guide](docs/OPERATIONS.md#systemd-deployment). The unit
-enables the read-only public site on TCP `8082` and intentionally leaves the
-admin service disabled; add both admin flags and a private token file if you
-enable it.
+enables the read-only public TLS listener on TCP `8443` and its strict redirect
+listener on TCP `8083`; map external TCP `443` and `80` to those ports. It
+intentionally leaves admin disabled; add both admin flags and a private token
+file if you enable it.
 
 ## Development and verification
+
+Generate the embedded applications before running backend checks from a clean
+checkout:
+
+```bash
+npm ci --ignore-scripts --prefix web
+npm run --prefix web build:all
+```
 
 Backend checks:
 
@@ -349,10 +385,11 @@ CGO_ENABLED=0 go build -trimpath -o bin/generals-server ./cmd/generals-server
 The integration suite exercises real control sockets, authentication, rooms,
 game staging, start coordination, and bidirectional UDP relay traffic.
 
-The authored admin and public applications are in `web/`; their checked-in
+The authored admin and public applications are in `web/`; their generated
 production output is embedded from `internal/app/adminui/dist` and
-`internal/app/publicui/dist` by the Go standard library. To regenerate the
-public application after a frontend change:
+`internal/app/publicui/dist` by the Go standard library. Both `dist` trees are
+ignored by Git and must be generated before a direct Go build. To regenerate
+the public application after a frontend change:
 
 ```bash
 cd web
@@ -365,10 +402,11 @@ Use `npm run build:admin` (or the existing `npm run build`) for an admin-only
 change, or `npm run build:all` when both applications intentionally need to be
 rebuilt.
 
-Normal Go and Docker builds use the checked-in generated assets and do not need
-Node or frontend package credentials. Frontend development requires access to
-the packages declared in `web/package.json`. Never commit local package caches
-or `node_modules`.
+The Docker build generates both applications in its frontend stage before
+compiling the Go binary, so it does not depend on local bundles. Direct Go
+builds require the generation step above. Frontend development requires access
+to the packages declared in `web/package.json`. Never commit generated `dist`
+trees, local package caches, or `node_modules`.
 
 ## Operational boundaries
 

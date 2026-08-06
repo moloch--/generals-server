@@ -17,6 +17,8 @@ import (
 
 var existingServerFlagNames = []string{
 	"admin-listen",
+	"admin-tls-cert",
+	"admin-tls-key",
 	"admin-token-file",
 	"allow-insecure-password-auth",
 	"control-listen",
@@ -33,6 +35,10 @@ var existingServerFlagNames = []string{
 	"public-host",
 	"public-relay-port",
 	"public-web-listen",
+	"public-web-tls-cert",
+	"public-web-tls-key",
+	"public-web-redirect-listen",
+	"public-web-canonical-host",
 	"relay-bytes-per-second",
 	"relay-listen",
 	"relay-packets-per-second",
@@ -42,14 +48,15 @@ var existingServerFlagNames = []string{
 }
 
 type fakeOnlineServer struct {
-	start         func(context.Context) error
-	shutdown      func(context.Context) error
-	controlAddr   string
-	relayAddr     string
-	healthAddr    string
-	adminAddr     string
-	publicWebAddr string
-	errors        <-chan error
+	start                 func(context.Context) error
+	shutdown              func(context.Context) error
+	controlAddr           string
+	relayAddr             string
+	healthAddr            string
+	adminAddr             string
+	publicWebAddr         string
+	publicWebRedirectAddr string
+	errors                <-chan error
 }
 
 func (server *fakeOnlineServer) Start(ctx context.Context) error {
@@ -71,7 +78,10 @@ func (server *fakeOnlineServer) RelayAddress() string     { return server.relayA
 func (server *fakeOnlineServer) HealthAddress() string    { return server.healthAddr }
 func (server *fakeOnlineServer) AdminAddress() string     { return server.adminAddr }
 func (server *fakeOnlineServer) PublicWebAddress() string { return server.publicWebAddr }
-func (server *fakeOnlineServer) Errors() <-chan error     { return server.errors }
+func (server *fakeOnlineServer) PublicWebRedirectAddress() string {
+	return server.publicWebRedirectAddr
+}
+func (server *fakeOnlineServer) Errors() <-chan error { return server.errors }
 
 func TestRootCommandRegistersExistingFlags(t *testing.T) {
 	runner := &commandRunner{stdout: io.Discard, stderr: io.Discard}
@@ -116,7 +126,13 @@ func TestRootCommandBindsAllFlags(t *testing.T) {
 		"--health-listen=127.0.0.1:31002",
 		"--admin-listen=127.0.0.1:31003",
 		"--admin-token-file=/run/secrets/admin-token",
+		"--admin-tls-cert=/run/admin-tls/cert.pem",
+		"--admin-tls-key=/run/admin-tls/key.pem",
 		"--public-web-listen=127.0.0.1:31004",
+		"--public-web-tls-cert=/run/public-tls/cert.pem",
+		"--public-web-tls-key=/run/public-tls/key.pem",
+		"--public-web-redirect-listen=127.0.0.1:31005",
+		"--public-web-canonical-host=www.example.net",
 		"--public-host", "relay.example.net",
 		"--public-relay-port", "32001",
 		"--data-file=/var/lib/generals/profiles.db",
@@ -146,7 +162,13 @@ func TestRootCommandBindsAllFlags(t *testing.T) {
 	want.HealthAddr = "127.0.0.1:31002"
 	want.AdminAddr = "127.0.0.1:31003"
 	want.AdminTokenFile = "/run/secrets/admin-token"
+	want.AdminTLSCertFile = "/run/admin-tls/cert.pem"
+	want.AdminTLSKeyFile = "/run/admin-tls/key.pem"
 	want.PublicWebAddr = "127.0.0.1:31004"
+	want.PublicWebTLSCertFile = "/run/public-tls/cert.pem"
+	want.PublicWebTLSKeyFile = "/run/public-tls/key.pem"
+	want.PublicWebRedirectAddr = "127.0.0.1:31005"
+	want.PublicWebCanonicalHost = "www.example.net"
 	want.PublicHost = "relay.example.net"
 	want.PublicRelayPort = 32001
 	want.DataFile = "/var/lib/generals/profiles.db"

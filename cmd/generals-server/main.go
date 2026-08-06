@@ -25,6 +25,7 @@ type onlineServer interface {
 	HealthAddress() string
 	AdminAddress() string
 	PublicWebAddress() string
+	PublicWebRedirectAddress() string
 	Errors() <-chan error
 }
 
@@ -93,7 +94,13 @@ func newRootCommand(runner *commandRunner) *cobra.Command {
 	flags.StringVar(&cfg.HealthAddr, "health-listen", cfg.HealthAddr, "HTTP health/metrics listen address")
 	flags.StringVar(&cfg.AdminAddr, "admin-listen", cfg.AdminAddr, "HTTP admin API and web interface listen address (disabled by default)")
 	flags.StringVar(&cfg.AdminTokenFile, "admin-token-file", cfg.AdminTokenFile, "file containing the admin bearer token")
-	flags.StringVar(&cfg.PublicWebAddr, "public-web-listen", cfg.PublicWebAddr, "HTTP public web interface listen address (disabled by default)")
+	flags.StringVar(&cfg.AdminTLSCertFile, "admin-tls-cert", cfg.AdminTLSCertFile, "PEM certificate for HTTPS admin connections")
+	flags.StringVar(&cfg.AdminTLSKeyFile, "admin-tls-key", cfg.AdminTLSKeyFile, "PEM private key for HTTPS admin connections")
+	flags.StringVar(&cfg.PublicWebAddr, "public-web-listen", cfg.PublicWebAddr, "HTTP(S) public web interface listen address (disabled by default)")
+	flags.StringVar(&cfg.PublicWebTLSCertFile, "public-web-tls-cert", cfg.PublicWebTLSCertFile, "PEM certificate for HTTPS public web connections")
+	flags.StringVar(&cfg.PublicWebTLSKeyFile, "public-web-tls-key", cfg.PublicWebTLSKeyFile, "PEM private key for HTTPS public web connections")
+	flags.StringVar(&cfg.PublicWebRedirectAddr, "public-web-redirect-listen", cfg.PublicWebRedirectAddr, "HTTP-to-HTTPS public web redirect listen address (disabled by default)")
+	flags.StringVar(&cfg.PublicWebCanonicalHost, "public-web-canonical-host", cfg.PublicWebCanonicalHost, "bare canonical hostname for public web HTTPS redirects")
 	flags.StringVar(&cfg.PublicHost, "public-host", cfg.PublicHost, "public relay hostname advertised to clients")
 	flags.IntVar(&cfg.PublicRelayPort, "public-relay-port", cfg.PublicRelayPort, "public UDP relay port advertised to clients (zero uses the bound port)")
 	flags.StringVar(&cfg.DataFile, "data-file", cfg.DataFile, "SQLite profile database path")
@@ -178,6 +185,7 @@ func (runner *commandRunner) run(ctx context.Context, cfg app.Config) {
 		"health", server.HealthAddress(),
 		"admin", server.AdminAddress(),
 		"public_web", server.PublicWebAddress(),
+		"public_web_redirect", server.PublicWebRedirectAddress(),
 		"public_host", cfg.PublicHost,
 	)
 

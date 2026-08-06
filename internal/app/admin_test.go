@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -192,6 +193,9 @@ func TestAdminHTTPAuthenticationSecurityAndEmbeddedUI(t *testing.T) {
 	}
 	if overview.Header().Get("Access-Control-Allow-Origin") != "" {
 		t.Error("admin handler unexpectedly enabled cross-origin access")
+	}
+	if overview.Header().Get("Strict-Transport-Security") != "" {
+		t.Error("HTTP admin response unexpectedly enabled HSTS")
 	}
 	var envelope struct {
 		Data adminOverview `json:"data"`
@@ -713,6 +717,155 @@ func TestServerAdminLifecycleAndBindFailureCleanup(t *testing.T) {
 	}
 	if err := failed.Shutdown(context.Background()); err != nil {
 		t.Fatalf("shutdown after admin bind failure: %v", err)
+	}
+}
+
+func TestServerAdminTLSAuthenticatesAndRejectsPlaintext(t *testing.T) {
+	tokenFile := writeTestAdminToken(t)
+	certFile, keyFile, roots := writeTestTLSCertificate(t)
+	cfg := DefaultConfig()
+	cfg.ControlAddr = "127.0.0.1:0"
+	cfg.RelayAddr = "127.0.0.1:0"
+	cfg.HealthAddr = "127.0.0.1:0"
+	cfg.AdminAddr = "127.0.0.1:0"
+	cfg.AdminTokenFile = tokenFile
+	cfg.AdminTLSCertFile = certFile
+	cfg.AdminTLSKeyFile = keyFile
+	cfg.PublicHost = "127.0.0.1"
+	cfg.DataFile = ""
+	server, err := NewServer(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			t.Errorf("shutdown: %v", err)
+		}
+	}()
+
+	transport := &http.Transport{TLSClientConfig: &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		MaxVersion: tls.VersionTLS12,
+		RootCAs:    roots,
+		ServerName: "127.0.0.1",
+	}}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport, Timeout: 2 * time.Second}
+	baseURL := "https://" + server.AdminAddress()
+
+	unauthorized, err := client.Get(baseURL + "/api/admin/v1/overview")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unauthorized.Body.Close()
+	if unauthorized.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthorized HTTPS admin status = %s", unauthorized.Status)
+	}
+	if unauthorized.TLS == nil || unauthorized.TLS.Version != tls.VersionTLS12 {
+		t.Fatalf("admin TLS state = %#v", unauthorized.TLS)
+	}
+	if got := unauthorized.Header.Get("Strict-Transport-Security"); got != "max-age=31536000" {
+		t.Fatalf("Strict-Transport-Security = %q", got)
+	}
+
+	request, err := http.NewRequest(http.MethodGet, baseURL+"/api/admin/v1/overview", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+testAdminToken)
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("authenticated HTTPS admin status = %s", response.Status)
+	}
+
+	plaintextRequest, err := http.NewRequest(http.MethodGet, "http://"+server.AdminAddress()+"/api/admin/v1/overview", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plaintextRequest.Header.Set("Authorization", "Bearer "+testAdminToken)
+	plaintextResponse, plaintextErr := (&http.Client{Timeout: 2 * time.Second}).Do(plaintextRequest)
+	if plaintextErr == nil {
+		plaintextResponse.Body.Close()
+		if plaintextResponse.StatusCode == http.StatusOK {
+			t.Fatal("TLS-enabled admin listener accepted an authenticated plaintext request")
+		}
+	}
+}
+
+func TestNewServerValidatesAdminTLSConfiguration(t *testing.T) {
+	tokenFile := writeTestAdminToken(t)
+	tests := []struct {
+		name      string
+		configure func(*Config)
+		want      string
+	}{
+		{
+			name: "certificate without key",
+			configure: func(cfg *Config) {
+				cfg.AdminAddr = "127.0.0.1:0"
+				cfg.AdminTokenFile = tokenFile
+				cfg.AdminTLSCertFile = "admin-cert.pem"
+			},
+			want: "both --admin-tls-cert and --admin-tls-key",
+		},
+		{
+			name: "key without certificate",
+			configure: func(cfg *Config) {
+				cfg.AdminAddr = "127.0.0.1:0"
+				cfg.AdminTokenFile = tokenFile
+				cfg.AdminTLSKeyFile = "admin-key.pem"
+			},
+			want: "both --admin-tls-cert and --admin-tls-key",
+		},
+		{
+			name: "TLS without admin listener",
+			configure: func(cfg *Config) {
+				cfg.AdminTLSCertFile = "admin-cert.pem"
+				cfg.AdminTLSKeyFile = "admin-key.pem"
+			},
+			want: "require the admin server to be enabled",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.DataFile = ""
+			test.configure(&cfg)
+			if _, err := NewServer(cfg, nil); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("NewServer() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestServerAdminTLSCertificateLoadFailureClosesStore(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.AdminAddr = "127.0.0.1:0"
+	cfg.AdminTokenFile = writeTestAdminToken(t)
+	cfg.AdminTLSCertFile = filepath.Join(t.TempDir(), "missing-cert.pem")
+	cfg.AdminTLSKeyFile = filepath.Join(t.TempDir(), "missing-key.pem")
+	cfg.DataFile = ""
+	server, err := NewServer(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "load admin TLS certificate") {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if err := server.store.db.Ping(); err == nil {
+		t.Fatal("profile store remained open after admin TLS certificate load failure")
+	}
+	if err := server.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown after admin TLS certificate load failure: %v", err)
 	}
 }
 

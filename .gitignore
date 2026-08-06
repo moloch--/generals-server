@@ -10,6 +10,9 @@
 /admin-token
 /web/.heroui/
 /web/node_modules/
+/web/dist/
+/internal/app/adminui/dist/
+/internal/app/publicui/dist/
 **/.terraform/*
 *.tfplan
 *.tfstate

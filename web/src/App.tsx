@@ -1,5 +1,3 @@
-import {DataGrid, type DataGridColumn} from "@heroui-pro/react/data-grid";
-import {KPI} from "@heroui-pro/react/kpi";
 import type {IconDefinition} from "@fortawesome/fontawesome-svg-core";
 import {
   faAddressCard,
@@ -43,6 +41,8 @@ import {Modal} from "@heroui/react/modal";
 import {SearchField} from "@heroui/react/search-field";
 import {TextField} from "@heroui/react/textfield";
 import {FormEvent, useCallback, useEffect, useMemo, useState} from "react";
+
+import {DataGrid, type DataGridColumn} from "./components/DataGrid";
 
 import {
   AdminApi,
@@ -448,18 +448,16 @@ function Login({onAuthenticated}: {onAuthenticated: (token: string) => void}) {
 
 function MetricCard({label, value, detail, icon}: {label: string; value: number; detail: string; icon: IconDefinition}) {
   return (
-    <KPI>
-      <KPI.Header>
-        <KPI.Title>{label}</KPI.Title>
-        <KPI.Icon>
-          <FontAwesomeIcon aria-hidden="true" icon={icon} />
-        </KPI.Icon>
-      </KPI.Header>
-      <KPI.Content>
-        <KPI.Value value={value} />
-      </KPI.Content>
-      <KPI.Footer>{detail}</KPI.Footer>
-    </KPI>
+    <Card className="h-full" variant="secondary">
+      <Card.Content className="flex h-full flex-col gap-4 p-6">
+        <div className="flex items-center justify-between gap-3">
+          <p className="text-sm text-muted">{label}</p>
+          <FontAwesomeIcon aria-hidden="true" className="text-muted" icon={icon} />
+        </div>
+        <p className="text-3xl font-semibold tabular-nums tracking-tight">{value.toLocaleString()}</p>
+        <p className="mt-auto text-sm text-muted">{detail}</p>
+      </Card.Content>
+    </Card>
   );
 }
 

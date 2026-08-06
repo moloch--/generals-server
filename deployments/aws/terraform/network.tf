@@ -78,14 +78,36 @@ resource "aws_vpc_security_group_ingress_rule" "relay" {
   ip_protocol       = "udp"
 }
 
-resource "aws_vpc_security_group_ingress_rule" "public_web" {
+resource "aws_vpc_security_group_ingress_rule" "public_web_https" {
   for_each = var.allowed_public_web_ipv4_cidrs
 
   security_group_id = aws_security_group.server.id
-  description       = "Generals public web interface"
+  description       = "Generals HTTPS public web interface"
   cidr_ipv4         = each.value
-  from_port         = 8082
-  to_port           = 8082
+  from_port         = 443
+  to_port           = 443
+  ip_protocol       = "tcp"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "public_web_redirect" {
+  for_each = var.allowed_public_web_ipv4_cidrs
+
+  security_group_id = aws_security_group.server.id
+  description       = "Generals HTTP to HTTPS redirect"
+  cidr_ipv4         = each.value
+  from_port         = 80
+  to_port           = 80
+  ip_protocol       = "tcp"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "admin" {
+  for_each = var.allowed_admin_ipv4_cidrs
+
+  security_group_id = aws_security_group.server.id
+  description       = "Generals HTTPS admin interface from one operator host"
+  cidr_ipv4         = each.value
+  from_port         = 8081
+  to_port           = 8081
   ip_protocol       = "tcp"
 }
 

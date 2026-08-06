@@ -245,6 +245,9 @@ func newAdminHandler(tokenHash adminTokenHash, store *ProfileStore, hub *Hub, re
 
 func (a *adminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	setAdminSecurityHeaders(w)
+	if r.TLS != nil {
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000")
+	}
 	if strings.HasPrefix(r.URL.Path, "/api/") {
 		w.Header().Set("Cache-Control", "no-store")
 		if r.Method == http.MethodGet && r.URL.Path == "/api/admin/v1/events" {

@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,27 +15,29 @@ import (
 )
 
 type Server struct {
-	cfg          Config
-	log          *slog.Logger
-	store        *ProfileStore
-	relay        *Relay
-	hub          *Hub
-	control      *ControlServer
-	health       *http.Server
-	healthLn     net.Listener
-	publicWeb    *http.Server
-	publicWebLn  net.Listener
-	admin        *http.Server
-	adminLn      net.Listener
-	adminHandler *adminHandler
-	adminToken   adminTokenHash
-	cancel       context.CancelFunc
-	errors       chan error
-	mu           sync.Mutex
-	started      bool
-	closed       bool
-	shutdownDone chan struct{}
-	shutdownErr  error
+	cfg                 Config
+	log                 *slog.Logger
+	store               *ProfileStore
+	relay               *Relay
+	hub                 *Hub
+	control             *ControlServer
+	health              *http.Server
+	healthLn            net.Listener
+	publicWeb           *http.Server
+	publicWebLn         net.Listener
+	publicWebRedirect   *http.Server
+	publicWebRedirectLn net.Listener
+	admin               *http.Server
+	adminLn             net.Listener
+	adminHandler        *adminHandler
+	adminToken          adminTokenHash
+	cancel              context.CancelFunc
+	errors              chan error
+	mu                  sync.Mutex
+	started             bool
+	closed              bool
+	shutdownDone        chan struct{}
+	shutdownErr         error
 }
 
 func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
@@ -69,11 +72,17 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 	if cfg.ControlReadTimeout <= 0 || cfg.ControlWriteTimeout <= 0 {
 		return nil, errors.New("control read and write timeouts must be positive")
 	}
-	if err := validatePublicWebListenerPorts(cfg); err != nil {
+	if err := validatePublicWebConfiguration(cfg); err != nil {
 		return nil, err
 	}
 	if (cfg.AdminAddr == "") != (cfg.AdminTokenFile == "") {
 		return nil, errors.New("both --admin-listen and --admin-token-file are required when the admin server is enabled")
+	}
+	if (cfg.AdminTLSCertFile == "") != (cfg.AdminTLSKeyFile == "") {
+		return nil, errors.New("both --admin-tls-cert and --admin-tls-key are required when admin TLS is enabled")
+	}
+	if cfg.AdminTLSCertFile != "" && cfg.AdminAddr == "" {
+		return nil, errors.New("--admin-tls-cert and --admin-tls-key require the admin server to be enabled")
 	}
 	var adminToken adminTokenHash
 	if cfg.AdminAddr != "" {
@@ -97,6 +106,20 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 	}, nil
 }
 
+func loadHTTPServerTLSConfig(certFile, keyFile string) (*tls.Config, error) {
+	if certFile == "" {
+		return nil, nil
+	}
+	certificate, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, err
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{certificate},
+		MinVersion:   tls.VersionTLS12,
+	}, nil
+}
+
 func (s *Server) Start(parent context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -108,6 +131,18 @@ func (s *Server) Start(parent context.Context) error {
 	}
 	ctx, cancel := context.WithCancel(parent)
 	s.cancel = cancel
+	adminTLSConfig, err := loadHTTPServerTLSConfig(s.cfg.AdminTLSCertFile, s.cfg.AdminTLSKeyFile)
+	if err != nil {
+		cancel()
+		s.closed = true
+		return errors.Join(fmt.Errorf("load admin TLS certificate: %w", err), s.store.Close())
+	}
+	publicWebTLSConfig, err := loadHTTPServerTLSConfig(s.cfg.PublicWebTLSCertFile, s.cfg.PublicWebTLSKeyFile)
+	if err != nil {
+		cancel()
+		s.closed = true
+		return errors.Join(fmt.Errorf("load public web TLS certificate: %w", err), s.store.Close())
+	}
 	reportRuntimeError := func(err error) {
 		select {
 		case s.errors <- err:
@@ -152,10 +187,30 @@ func (s *Server) Start(parent context.Context) error {
 		}
 		s.publicWebLn = publicWebListener
 	}
+	var publicWebRedirectListener net.Listener
+	if s.cfg.PublicWebRedirectAddr != "" {
+		publicWebRedirectListener, err = net.Listen("tcp", s.cfg.PublicWebRedirectAddr)
+		if err != nil {
+			if publicWebListener != nil {
+				_ = publicWebListener.Close()
+			}
+			_ = listener.Close()
+			_ = s.control.Close()
+			_ = s.relay.Close()
+			cancel()
+			s.control.Wait()
+			s.closed = true
+			return errors.Join(fmt.Errorf("listen for public web redirect requests: %w", err), s.store.Close())
+		}
+		s.publicWebRedirectLn = publicWebRedirectListener
+	}
 	var adminListener net.Listener
 	if s.cfg.AdminAddr != "" {
 		adminListener, err = net.Listen("tcp", s.cfg.AdminAddr)
 		if err != nil {
+			if publicWebRedirectListener != nil {
+				_ = publicWebRedirectListener.Close()
+			}
 			if publicWebListener != nil {
 				_ = publicWebListener.Close()
 			}
@@ -184,6 +239,17 @@ func (s *Server) Start(parent context.Context) error {
 	if publicWebListener != nil {
 		s.publicWeb = &http.Server{
 			Handler:           newPublicHandler(s.hub, s.store, s.log),
+			TLSConfig:         publicWebTLSConfig,
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       10 * time.Second,
+			WriteTimeout:      10 * time.Second,
+			IdleTimeout:       30 * time.Second,
+			MaxHeaderBytes:    16 * 1024,
+		}
+	}
+	if publicWebRedirectListener != nil {
+		s.publicWebRedirect = &http.Server{
+			Handler:           newPublicWebRedirectHandler(s.cfg.PublicWebCanonicalHost),
 			ReadHeaderTimeout: 5 * time.Second,
 			ReadTimeout:       10 * time.Second,
 			WriteTimeout:      10 * time.Second,
@@ -198,6 +264,7 @@ func (s *Server) Start(parent context.Context) error {
 		s.adminHandler = newAdminHandler(s.adminToken, s.store, s.hub, s.relay, s.log, startedAt)
 		s.admin = &http.Server{
 			Handler:           s.adminHandler,
+			TLSConfig:         adminTLSConfig,
 			ReadHeaderTimeout: 5 * time.Second,
 			ReadTimeout:       10 * time.Second,
 			WriteTimeout:      10 * time.Second,
@@ -212,14 +279,33 @@ func (s *Server) Start(parent context.Context) error {
 	}()
 	if s.publicWeb != nil {
 		go func() {
-			if err := s.publicWeb.Serve(publicWebListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			var err error
+			if publicWebTLSConfig != nil {
+				err = s.publicWeb.ServeTLS(publicWebListener, "", "")
+			} else {
+				err = s.publicWeb.Serve(publicWebListener)
+			}
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
 				reportRuntimeError(fmt.Errorf("serve public web requests: %w", err))
+			}
+		}()
+	}
+	if s.publicWebRedirect != nil {
+		go func() {
+			if err := s.publicWebRedirect.Serve(publicWebRedirectListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				reportRuntimeError(fmt.Errorf("serve public web redirect requests: %w", err))
 			}
 		}()
 	}
 	if s.admin != nil {
 		go func() {
-			if err := s.admin.Serve(adminListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			var err error
+			if adminTLSConfig != nil {
+				err = s.admin.ServeTLS(adminListener, "", "")
+			} else {
+				err = s.admin.Serve(adminListener)
+			}
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
 				reportRuntimeError(fmt.Errorf("serve admin requests: %w", err))
 			}
 		}()
@@ -253,12 +339,19 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	health := s.health
 	publicWeb := s.publicWeb
+	publicWebRedirect := s.publicWebRedirect
 	admin := s.admin
 	adminHandler := s.adminHandler
 	s.mu.Unlock()
 
 	var errs []error
 	if wasStarted {
+		if publicWebRedirect != nil {
+			if err := publicWebRedirect.Shutdown(ctx); err != nil {
+				errs = append(errs, err)
+				_ = publicWebRedirect.Close()
+			}
+		}
 		if publicWeb != nil {
 			if err := publicWeb.Shutdown(ctx); err != nil {
 				errs = append(errs, err)
@@ -326,6 +419,16 @@ func (s *Server) PublicWebAddress() string {
 		return s.publicWebLn.Addr().String()
 	}
 	return s.cfg.PublicWebAddr
+}
+
+// GeneralsX @feature OpenAI 06/08/2026 Report the independently bound public HTTP redirect address.
+func (s *Server) PublicWebRedirectAddress() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.publicWebRedirectLn != nil {
+		return s.publicWebRedirectLn.Addr().String()
+	}
+	return s.cfg.PublicWebRedirectAddr
 }
 
 func (s *Server) AdminAddress() string {

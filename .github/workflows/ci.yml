@@ -15,6 +15,18 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v6
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24.x"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build embedded applications
+        run: |
+          npm ci --ignore-scripts --prefix web
+          npm run --prefix web build:all
+
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
@@ -22,7 +34,7 @@ jobs:
           cache: true
 
       - name: Verify formatting
-        run: test -z "$(gofmt -l .)"
+        run: test -z "$(gofmt -l $(git ls-files '*.go'))"
 
       - name: Vet
         run: go vet ./...
@@ -61,16 +73,21 @@ jobs:
           cache-dependency-path: web/package-lock.json
 
       - name: Install frontend dependencies
-        run: npm ci --prefix web
+        run: npm ci --ignore-scripts --prefix web
 
       - name: Type-check frontend source
         run: npm run --prefix web typecheck
 
-      - name: Build embedded public application
-        run: npm run --prefix web build:public
+      - name: Build embedded applications
+        run: npm run --prefix web build:all
 
-      - name: Verify embedded assets are current
-        run: git diff --exit-code -- internal/app/publicui/dist
+      - name: Verify embedded assets are generated and ignored
+        run: |
+          test -s internal/app/adminui/dist/index.html
+          test -s internal/app/publicui/dist/index.html
+          test -z "$(git ls-files -- internal/app/adminui/dist internal/app/publicui/dist)"
+          git check-ignore --quiet internal/app/adminui/dist/index.html
+          git check-ignore --quiet internal/app/publicui/dist/index.html
 
       - name: Verify public assets contain no admin client
         run: |
@@ -114,6 +131,7 @@ jobs:
 
       - name: Check host scripts
         run: |
+          sh -n deployments/renew-certificate.sh
           for script in deployments/aws/runtime/generals-*; do
             case "$script" in
               *.service|*.timer) continue ;;
@@ -128,13 +146,29 @@ jobs:
           CLOUDWATCH_LOG_GROUP: /generals-server/test/server
           GENERALS_IMAGE: 123456789012.dkr.ecr.us-west-2.amazonaws.com/generals-server@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
           GENERALS_PLATFORM: linux/arm64
+          GENERALS_ADMIN_HOST: 127.0.0.1
           GENERALS_PUBLIC_HOST: online.example.net
-        run: docker compose -f deployments/aws/runtime/compose.yaml config --quiet
+          GENERALS_PUBLIC_WEB_HOST: example.net
+        run: |
+          docker compose -f deployments/aws/runtime/compose.yaml config --format json | jq --exit-status '
+            .services["generals-server"] as $service |
+            $service.ports as $ports |
+            any($ports[]; .target == 8443 and (.published | tostring) == "443") and
+            any($ports[]; .target == 8083 and (.published | tostring) == "80") and
+            any($ports[]; .target == 8080 and .host_ip == "127.0.0.1") and
+            any($ports[]; .target == 8081 and .host_ip == env.GENERALS_ADMIN_HOST) and
+            all($ports[]; .target != 8082) and
+            ($service.command | index("--public-web-tls-cert=/tls/fullchain.pem") != null) and
+            ($service.command | index("--public-web-tls-key=/tls/privkey.pem") != null) and
+            ($service.command | index("--public-web-canonical-host=" + env.GENERALS_PUBLIC_WEB_HOST) != null)
+          '
 
       - name: Render standard Compose definition
         env:
           GENERALS_ADMIN_HOST: 100.64.0.1
           GENERALS_ADMIN_TOKEN_FILE: /tmp/generals-admin-token
+          GENERALS_ADMIN_TLS_CERT: /tls/fullchain.pem
+          GENERALS_ADMIN_TLS_KEY: /tls/privkey.pem
           GENERALS_DATA_DIR: /tmp/generals-data
           GENERALS_GID: "1000"
           GENERALS_PUBLIC_HOST: online.example.net
@@ -142,8 +176,18 @@ jobs:
           GENERALS_UID: "1000"
         run: |
           docker compose config --format json | jq --exit-status '
-            .services["generals-server"].ports as $ports |
-            any($ports[]; .target == 8082 and (has("host_ip") | not)) and
+            .services["generals-server"] as $service |
+            $service.ports as $ports |
+            any($ports[]; .target == 8443 and (.published | tostring) == "443") and
+            any($ports[]; .target == 8083 and (.published | tostring) == "80") and
             any($ports[]; .target == 8080 and .host_ip == "127.0.0.1") and
-            any($ports[]; .target == 8081 and .host_ip == env.GENERALS_ADMIN_HOST)
+            any($ports[]; .target == 8081 and .host_ip == env.GENERALS_ADMIN_HOST) and
+            all($ports[]; .target != 8082) and
+            ($service.command | index("--public-web-listen=:8443") != null) and
+            ($service.command | index("--public-web-tls-cert=/tls/fullchain.pem") != null) and
+            ($service.command | index("--public-web-tls-key=/tls/privkey.pem") != null) and
+            ($service.command | index("--public-web-redirect-listen=:8083") != null) and
+            ($service.command | index("--public-web-canonical-host=" + env.GENERALS_PUBLIC_HOST) != null) and
+            ($service.command | index("--admin-tls-cert=" + env.GENERALS_ADMIN_TLS_CERT) != null) and
+            ($service.command | index("--admin-tls-key=" + env.GENERALS_ADMIN_TLS_KEY) != null)
           '

@@ -146,11 +146,13 @@ mock_provider "aws" {
 }
 
 variables {
-  acme_email              = "operator@example.com"
-  container_image_digest  = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-  expected_aws_account_id = "123456789012"
-  hostname                = "online.example.com"
-  route53_zone_id         = "Z1234567890TEST"
+  acme_email               = "operator@example.com"
+  allowed_admin_ipv4_cidrs = []
+  container_image_digest   = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  expected_aws_account_id  = "123456789012"
+  hostname                 = "online.example.com"
+  public_hostname          = "example.com"
+  route53_zone_id          = "Z1234567890TEST"
 }
 
 run "cost_effective_single_host_topology" {
@@ -199,6 +201,14 @@ run "cost_effective_single_host_topology" {
   }
 
   assert {
+    condition = length(regexall(
+      "mkfs\\.xfs\\s+-L\\s+[A-Za-z0-9_-]{1,12}\\s+\"\\$data_device\"",
+      file("${path.module}/templates/user-data.sh.tftpl"),
+    )) == 1
+    error_message = "The XFS data-volume label must be 1-12 ASCII bytes so mkfs.xfs accepts it."
+  }
+
+  assert {
     condition = (
       !aws_subnet.public.map_public_ip_on_launch &&
       aws_route.internet.destination_cidr_block == "0.0.0.0/0" &&
@@ -211,6 +221,7 @@ run "cost_effective_single_host_topology" {
 
   assert {
     condition = (
+      aws_security_group.server.description == "Public Generals control, relay, and read-only web traffic only" &&
       length(aws_vpc_security_group_ingress_rule.control) == 1 &&
       one(values(aws_vpc_security_group_ingress_rule.control)).from_port == 29900 &&
       one(values(aws_vpc_security_group_ingress_rule.control)).to_port == 29900 &&
@@ -219,24 +230,64 @@ run "cost_effective_single_host_topology" {
       one(values(aws_vpc_security_group_ingress_rule.relay)).from_port == 27901 &&
       one(values(aws_vpc_security_group_ingress_rule.relay)).to_port == 27901 &&
       one(values(aws_vpc_security_group_ingress_rule.relay)).ip_protocol == "udp" &&
-      length(aws_vpc_security_group_ingress_rule.public_web) == 1 &&
-      one(values(aws_vpc_security_group_ingress_rule.public_web)).from_port == 8082 &&
-      one(values(aws_vpc_security_group_ingress_rule.public_web)).to_port == 8082 &&
-      one(values(aws_vpc_security_group_ingress_rule.public_web)).ip_protocol == "tcp" &&
-      length(regexall("from_port\\s*=\\s*808[01]", file("${path.module}/network.tf"))) == 0 &&
-      length(regexall("to_port\\s*=\\s*808[01]", file("${path.module}/network.tf"))) == 0
+      length(aws_vpc_security_group_ingress_rule.public_web_https) == 1 &&
+      one(values(aws_vpc_security_group_ingress_rule.public_web_https)).from_port == 443 &&
+      one(values(aws_vpc_security_group_ingress_rule.public_web_https)).to_port == 443 &&
+      one(values(aws_vpc_security_group_ingress_rule.public_web_https)).ip_protocol == "tcp" &&
+      length(aws_vpc_security_group_ingress_rule.public_web_redirect) == 1 &&
+      one(values(aws_vpc_security_group_ingress_rule.public_web_redirect)).from_port == 80 &&
+      one(values(aws_vpc_security_group_ingress_rule.public_web_redirect)).to_port == 80 &&
+      one(values(aws_vpc_security_group_ingress_rule.public_web_redirect)).ip_protocol == "tcp" &&
+      length(aws_vpc_security_group_ingress_rule.admin) == 0 &&
+      local.admin_bind_host == "127.0.0.1" &&
+      local.admin_tls_cert == "" &&
+      local.admin_tls_key == "" &&
+      length(regexall("(?:from_port|to_port)\\s*=\\s*808[02]", file("${path.module}/network.tf"))) == 0
     )
-    error_message = "Only control, relay, and public web may receive ingress; health and admin must remain private."
+    error_message = "The managed security-group identity must stay stable while gameplay and public TCP 80/443 are reachable and private ports remain closed by default."
   }
 
   assert {
     condition = (
-      output.public_web_url == "http://online.example.com:8082/" &&
-      length(regexall("127\\.0\\.0\\.1:8080:8080/tcp", file("${path.module}/../runtime/compose.yaml"))) == 1 &&
-      length(regexall("127\\.0\\.0\\.1:8081:8081/tcp", file("${path.module}/../runtime/compose.yaml"))) == 1 &&
-      length(regexall("8082:8082/tcp", file("${path.module}/../runtime/compose.yaml"))) == 1
+      output.public_web_url == "https://example.com/" &&
+      strcontains(file("${path.module}/../runtime/compose.yaml"), "127.0.0.1:8080:8080/tcp") &&
+      strcontains(file("${path.module}/../runtime/compose.yaml"), "host_ip: \"$${GENERALS_ADMIN_HOST:?set GENERALS_ADMIN_HOST}\"") &&
+      strcontains(file("${path.module}/../runtime/compose.yaml"), "443:8443/tcp") &&
+      strcontains(file("${path.module}/../runtime/compose.yaml"), "80:8083/tcp") &&
+      strcontains(file("${path.module}/../runtime/compose.yaml"), "--public-web-listen=:8443") &&
+      strcontains(file("${path.module}/../runtime/compose.yaml"), "--public-web-tls-cert=/tls/fullchain.pem") &&
+      strcontains(file("${path.module}/../runtime/compose.yaml"), "--public-web-tls-key=/tls/privkey.pem") &&
+      strcontains(file("${path.module}/../runtime/compose.yaml"), "--public-web-redirect-listen=:8083") &&
+      strcontains(file("${path.module}/../runtime/compose.yaml"), "--public-web-canonical-host=$${GENERALS_PUBLIC_WEB_HOST:?set GENERALS_PUBLIC_WEB_HOST}") &&
+      length(regexall("8082", file("${path.module}/../runtime/compose.yaml"))) == 0
     )
-    error_message = "Runtime Compose must publish only public web broadly while keeping health and admin on loopback."
+    error_message = "Runtime Compose must map public HTTPS and redirect ports without publishing origin 8082, health, or unrestricted admin."
+  }
+
+  assert {
+    condition = (
+      strcontains(file("${path.module}/../runtime/compose.yaml"), "--admin-tls-cert=$${GENERALS_ADMIN_TLS_CERT:-}") &&
+      strcontains(file("${path.module}/../runtime/compose.yaml"), "--admin-tls-key=$${GENERALS_ADMIN_TLS_KEY:-}") &&
+      strcontains(file("${path.module}/templates/host.conf.tftpl"), "ADMIN_BIND_HOST_B64=\"$${admin_bind_host_b64}\"") &&
+      strcontains(file("${path.module}/templates/host.conf.tftpl"), "ADMIN_TLS_CERT_B64=\"$${admin_tls_cert_b64}\"") &&
+      strcontains(file("${path.module}/templates/host.conf.tftpl"), "ADMIN_TLS_KEY_B64=\"$${admin_tls_key_b64}\"") &&
+      strcontains(file("${path.module}/templates/host.conf.tftpl"), "PUBLIC_HOSTNAME_B64=\"$${public_hostname_b64}\"") &&
+      strcontains(file("${path.module}/../runtime/generals-deploy"), "GENERALS_ADMIN_HOST=$admin_bind_host") &&
+      strcontains(file("${path.module}/../runtime/generals-deploy"), "GENERALS_ADMIN_TLS_CERT=$admin_tls_cert") &&
+      strcontains(file("${path.module}/../runtime/generals-deploy"), "GENERALS_ADMIN_TLS_KEY=$admin_tls_key") &&
+      strcontains(file("${path.module}/../runtime/generals-deploy"), "GENERALS_PUBLIC_WEB_HOST=$public_hostname")
+    )
+    error_message = "Admin bind and TLS settings must be wired through host config, deployment environment, and Compose."
+  }
+
+  assert {
+    condition = (
+      strcontains(file("${path.module}/../runtime/generals-readiness"), "source /etc/generals-server/deployment.env") &&
+      strcontains(file("${path.module}/../runtime/generals-readiness"), "--resolve \"$GENERALS_PUBLIC_WEB_HOST:443:127.0.0.1\"") &&
+      strcontains(file("${path.module}/../runtime/generals-readiness"), "https://$GENERALS_PUBLIC_WEB_HOST/api/public/v1/snapshot") &&
+      strcontains(file("${path.module}/../runtime/generals-readiness"), "https://$GENERALS_PUBLIC_WEB_HOST/leaderboard?probe=readiness")
+    )
+    error_message = "Readiness must validate the hostname-matched HTTPS endpoint and exact canonical redirect through host ports 443 and 80."
   }
 
   assert {
@@ -244,9 +295,25 @@ run "cost_effective_single_host_topology" {
       aws_route53_record.server.type == "A" &&
       aws_route53_record.server.ttl == 300 &&
       length(aws_route53_record.server.records) == 1 &&
-      contains(aws_route53_record.server.records, aws_eip.server.public_ip)
+      contains(aws_route53_record.server.records, aws_eip.server.public_ip) &&
+      aws_route53_record.public_web.name == "example.com" &&
+      aws_route53_record.public_web.type == "A" &&
+      aws_route53_record.public_web.ttl == 300 &&
+      length(aws_route53_record.public_web.records) == 1 &&
+      contains(aws_route53_record.public_web.records, aws_eip.server.public_ip)
     )
-    error_message = "Route 53 must point the player hostname directly at the stable EIP."
+    error_message = "Route 53 must point both gameplay and public-web hostnames directly at the stable EIP."
+  }
+
+  assert {
+    condition = (
+      strcontains(file("${path.module}/iam.tf"), "_acme-challenge.$${var.hostname}") &&
+      strcontains(file("${path.module}/iam.tf"), "_acme-challenge.$${var.public_hostname}") &&
+      strcontains(file("${path.module}/../runtime/generals-ensure-certificate"), "openssl x509 -in \"$certificate\" -noout -checkhost \"$hostname\"") &&
+      strcontains(file("${path.module}/../runtime/generals-ensure-certificate"), "openssl x509 -in \"$certificate\" -noout -checkhost \"$public_hostname\"") &&
+      strcontains(file("${path.module}/../runtime/generals-ensure-certificate"), "--domain \"$public_hostname\"")
+    )
+    error_message = "ACME permissions, issuance, and certificate verification must cover both gameplay and public-web hostnames."
   }
 
   assert {
@@ -287,11 +354,54 @@ run "cost_effective_single_host_topology" {
     condition = (
       length(regexall("resource\\s+\"aws_ebs_volume\"\\s+\"data\"[\\s\\S]*?prevent_destroy\\s*=\\s*true", file("${path.module}/compute.tf"))) == 1 &&
       length(regexall("replace_triggered_by\\s*=", file("${path.module}/compute.tf"))) == 1 &&
+      length(regexall("ignore_changes\\s*=\\s*\\[[^]]*associate_public_ip_address[^]]*\\]", file("${path.module}/compute.tf"))) == 1 &&
       length(regexall("value_wo\\s*=\\s*ephemeral\\.random_password\\.admin_token\\.result", file("${path.module}/parameters.tf"))) == 1 &&
       length(regexall("use_lockfile\\s*=\\s*true", file("${path.module}/versions.tf"))) == 1
     )
-    error_message = "Retained-volume, host-replacement, state-free-secret, and S3-lockfile safeguards must remain explicit."
+    error_message = "Retained-volume, host-replacement, EIP-readback, state-free-secret, and S3-lockfile safeguards must remain explicit."
   }
+}
+
+run "restricted_https_admin_ingress" {
+  command = plan
+
+  variables {
+    allowed_admin_ipv4_cidrs = ["136.24.56.7/32"]
+  }
+
+  assert {
+    condition = (
+      length(aws_vpc_security_group_ingress_rule.admin) == 1 &&
+      one(values(aws_vpc_security_group_ingress_rule.admin)).cidr_ipv4 == "136.24.56.7/32" &&
+      one(values(aws_vpc_security_group_ingress_rule.admin)).from_port == 8081 &&
+      one(values(aws_vpc_security_group_ingress_rule.admin)).to_port == 8081 &&
+      one(values(aws_vpc_security_group_ingress_rule.admin)).ip_protocol == "tcp" &&
+      local.admin_bind_host == "0.0.0.0" &&
+      local.admin_tls_cert == "/tls/fullchain.pem" &&
+      local.admin_tls_key == "/tls/privkey.pem"
+    )
+    error_message = "An explicit admin /32 must create exactly one TCP 8081 ingress rule and publish the container with managed TLS."
+  }
+}
+
+run "reject_admin_network_cidr" {
+  command = plan
+
+  variables {
+    allowed_admin_ipv4_cidrs = ["136.24.56.0/24"]
+  }
+
+  expect_failures = [var.allowed_admin_ipv4_cidrs]
+}
+
+run "reject_admin_ipv6_cidr" {
+  command = plan
+
+  variables {
+    allowed_admin_ipv4_cidrs = ["2001:db8::/32"]
+  }
+
+  expect_failures = [var.allowed_admin_ipv4_cidrs]
 }
 
 run "reject_mutable_image_reference" {
@@ -312,6 +422,26 @@ run "reject_hostname_outside_hosted_zone" {
   }
 
   expect_failures = [check.hostname_in_public_zone]
+}
+
+run "reject_public_hostname_outside_hosted_zone" {
+  command = plan
+
+  variables {
+    public_hostname = "public.example.net"
+  }
+
+  expect_failures = [check.public_hostname_in_public_zone]
+}
+
+run "reject_duplicate_public_hostname" {
+  command = plan
+
+  variables {
+    public_hostname = "online.example.com"
+  }
+
+  expect_failures = [check.public_hostname_in_public_zone]
 }
 
 run "reject_cross_region_availability_zone" {

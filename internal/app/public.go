@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
+	"net/url"
 	"path"
 	"strconv"
 	"strings"
@@ -20,6 +21,14 @@ const (
 	publicLeaderboardLimit    = 25
 	publicLeaderboardCacheTTL = 2 * time.Second
 )
+
+var publicPageRoutes = []string{
+	"/leaderboard",
+	"/game-lobbies",
+	"/online-players",
+	"/active-games",
+	"/how-to-play",
+}
 
 // GeneralsX @feature OpenAI 06/08/2026 Define a fixed public schema that cannot inherit admin fields.
 type publicOverview struct {
@@ -122,7 +131,7 @@ func newPublicHandler(activity publicActivityReader, leaderboard publicLeaderboa
 	}
 	handler.mux.HandleFunc("GET /api/public/v1/snapshot", handler.handleSnapshot)
 	handler.mux.HandleFunc("GET /{$}", handler.handleIndex)
-	for _, route := range []string{"/leaderboard", "/game-lobbies", "/online-players", "/active-games"} {
+	for _, route := range publicPageRoutes {
 		handler.mux.HandleFunc("GET "+route, handler.handleIndex)
 	}
 	handler.mux.HandleFunc("GET /assets/", handler.handleAsset)
@@ -132,7 +141,69 @@ func newPublicHandler(activity publicActivityReader, leaderboard publicLeaderboa
 
 func (p *publicHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	setPublicSecurityHeaders(w)
+	if r.TLS != nil {
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000")
+	}
+	if !isCanonicalPublicRequestPath(r.URL.Path) {
+		http.NotFound(w, r)
+		return
+	}
 	p.mux.ServeHTTP(w, r)
+}
+
+// GeneralsX @feature OpenAI 06/08/2026 Redirect only known public routes without sharing the public or admin mux.
+func newPublicWebRedirectHandler(canonicalHost string) http.Handler {
+	assets := publicui.Files()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		setPublicSecurityHeaders(w)
+		w.Header().Set("Cache-Control", "no-store")
+		if !isAllowedPublicRedirectRequest(r, assets) {
+			http.NotFound(w, r)
+			return
+		}
+		target := (&url.URL{
+			Scheme:   "https",
+			Host:     canonicalHost,
+			Path:     r.URL.Path,
+			RawPath:  r.URL.RawPath,
+			RawQuery: r.URL.RawQuery,
+		}).String()
+		http.Redirect(w, r, target, http.StatusPermanentRedirect)
+	})
+}
+
+func isAllowedPublicRedirectRequest(r *http.Request, assets fs.FS) bool {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return false
+	}
+	requestPath := r.URL.Path
+	if !isCanonicalPublicRequestPath(requestPath) {
+		return false
+	}
+	if isPublicPageRoute(requestPath) || requestPath == "/generalsx-zh-icon.png" || requestPath == "/api/public/v1/snapshot" {
+		return true
+	}
+	if !strings.HasPrefix(requestPath, "/assets/") || len(requestPath) == len("/assets/") {
+		return false
+	}
+	asset, err := fs.Stat(assets, strings.TrimPrefix(requestPath, "/"))
+	return err == nil && !asset.IsDir()
+}
+
+func isPublicPageRoute(requestPath string) bool {
+	if requestPath == "/" {
+		return true
+	}
+	for _, route := range publicPageRoutes {
+		if requestPath == route {
+			return true
+		}
+	}
+	return false
+}
+
+func isCanonicalPublicRequestPath(requestPath string) bool {
+	return requestPath != "" && path.Clean(requestPath) == requestPath
 }
 
 func (p *publicHandler) handleSnapshot(w http.ResponseWriter, r *http.Request) {

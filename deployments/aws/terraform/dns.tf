@@ -17,3 +17,10 @@ resource "aws_route53_record" "server" {
   records = [aws_eip.server.public_ip]
 }
 
+resource "aws_route53_record" "public_web" {
+  zone_id = data.aws_route53_zone.server.zone_id
+  name    = var.public_hostname
+  type    = "A"
+  ttl     = 300
+  records = [aws_eip.server.public_ip]
+}

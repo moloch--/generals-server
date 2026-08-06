@@ -7,9 +7,13 @@ CloudWatch Logs.
 
 It intentionally creates no load balancer, NAT Gateway, Auto Scaling group,
 backup policy, snapshot schedule, SSH listener, bastion, or multi-AZ replica.
-TCP `29900`, UDP `27901`, and the read-only website on TCP `8082` are public
-inbound ports. Health TCP `8080` and admin TCP `8081` bind to host loopback and
-are reachable through Session Manager port forwarding.
+TCP `29900` and UDP `27901` carry gameplay. The read-only site uses HTTPS TCP
+`443`, with TCP `80` serving only canonical HTTPS redirects. Health TCP `8080`
+always binds to host loopback. Admin TCP `8081` also stays on loopback over HTTP
+unless `allowed_admin_ipv4_cidrs` contains explicit IPv4 `/32` hosts; that mode
+enables HTTPS and grants ingress only to those operator addresses. Container
+ports `8443` and `8083` back the public mappings, while origin TCP `8082` is not
+opened or used by this AWS deployment.
 
 ## Availability and data boundary
 
@@ -37,11 +41,11 @@ recover an unavailable Availability Zone or damaged EBS data.
 
 The server image is pinned by digest. Updating the digest changes a non-secret
 Parameter Store value; the host reconciles it within five minutes without
-replacing EC2. Host-configuration inputs such as hostname, repository,
-architecture, ACME email, or an explicitly pinned AMI produce a visible EC2
-replacement in the plan. Edits only to embedded bootstrap scripts deliberately
-require `-replace=aws_instance.server`; Terraform never performs a useless
-user-data stop/start that cloud-init would not replay.
+replacing EC2. Host-configuration inputs such as either hostname, repository,
+architecture, ACME email, admin exposure mode, or an explicitly pinned AMI
+produce a visible EC2 replacement in the plan. Edits only to embedded bootstrap
+scripts deliberately require `-replace=aws_instance.server`; Terraform never
+performs a useless user-data stop/start that cloud-init would not replay.
 
 ## Prerequisites
 
@@ -122,11 +126,16 @@ Set at least:
 
 - the expected AWS account ID;
 - Region and one Availability Zone;
-- public hostname and hosted-zone ID;
+- distinct gameplay and public-web hostnames in the selected hosted zone;
 - ACME contact email;
 - ECR repository name and published image digest.
 - optional gameplay and public-web IPv4 CIDR allowlists; both default to the
   public Internet.
+
+Leave `allowed_admin_ipv4_cidrs` empty to keep admin on loopback. To permit
+direct browser access from a fixed operator address, add only exact hosts, for
+example `allowed_admin_ipv4_cidrs = ["192.0.2.10/32"]`. Broader networks and
+IPv6 ranges are rejected.
 
 Initialize the backend using the bucket created above:
 
@@ -146,17 +155,25 @@ terraform plan -out deployment.tfplan
 terraform apply deployment.tfplan
 ```
 
+An existing host whose embedded Compose file predates the TCP `80`/`443`
+mapping must be updated through the controlled replacement procedure below (or
+an equivalent reviewed SSM installation of every changed runtime file).
+Changing only the image digest or security-group rules does not rewrite files
+that cloud-init installed from EC2 user data.
+
 Terraform generates the 64-character admin token with an ephemeral random
 value and writes it through Parameter Store's write-only attribute. The token
 does not enter the Terraform plan or state. Increment `admin_token_version` and
 apply to rotate it.
 
-The host obtains a free Let's Encrypt certificate with the Route 53 DNS-01
-plugin, so public TCP `80` is never opened. Complete Certbot state and the
-exported PEM files reside on the retained EBS volume. A systemd timer checks for
-renewal twice daily. Hostname, expiry, and key pairing are validated, and the
-container is restarted only when a new pair has passed readiness; failed loads
-remain pending for the next reconciliation.
+The host obtains one free Let's Encrypt certificate containing both gameplay
+and public-web DNS names through the Route 53 DNS-01 plugin. Public TCP `80` is
+therefore used only for application redirects, never for ACME challenges.
+Complete Certbot state and the exported PEM files reside on the retained EBS
+volume. A systemd timer checks for renewal twice daily. Both hostnames, expiry,
+and key pairing are validated, and the container is restarted only when a new
+pair has passed HTTPS readiness; failed loads remain pending for the next
+reconciliation.
 
 ## 4. Verify the host
 
@@ -178,8 +195,8 @@ Verify the public TLS control endpoint:
 
 ```bash
 openssl s_client \
-  -connect "$(terraform output -raw public_hostname):29900" \
-  -servername "$(terraform output -raw public_hostname)" \
+  -connect "$(terraform output -raw gameplay_hostname):29900" \
+  -servername "$(terraform output -raw gameplay_hostname)" \
   -verify_return_error </dev/null
 ```
 
@@ -192,20 +209,30 @@ Verify the independently routed public website and snapshot API:
 public_web_url=$(terraform output -raw public_web_url)
 curl --fail --show-error --silent "$public_web_url" >/dev/null
 curl --fail --show-error --silent "${public_web_url}api/public/v1/snapshot"
+curl --head "http://$(terraform output -raw public_hostname)/leaderboard?from=http"
 ```
 
-The supplied single-host stack exposes TCP `8082` as plaintext origin HTTP. For
-a browser-facing production site, terminate HTTPS separately on TCP `443` and
-forward only public-site requests to this origin; the stack intentionally does
-not claim built-in web TLS or send private admin TCP `8081` through that path.
-
-TCP `8082` exposes only read-only public data. The private admin UI and every
-`/api/admin/v1/*` route remain unavailable there even if a request supplies an
+Docker maps host TCP `443` to the application's dedicated TLS listener on
+container TCP `8443` and host TCP `80` to its minimal redirect listener on
+container TCP `8083`. Both reuse the managed PEM files. The security group and
+Compose file expose no host TCP `8082`. Admin, health, and metrics paths are not
+served or redirected by either public handler, even when a request supplies an
 admin bearer token.
 
 ## Admin access
 
-Start the tunnel printed by Terraform:
+When `allowed_admin_ipv4_cidrs` is configured, open the gameplay hostname from
+an allowlisted address using the certificate-protected endpoint:
+
+```text
+https://online.example.net:8081/admin/
+```
+
+The security group rejects TCP `8081` from every other public source. Do not
+use the Elastic IP in the URL because the managed certificate covers only the
+configured DNS names.
+
+With the default empty allowlist, start the tunnel printed by Terraform:
 
 ```bash
 terraform output -raw admin_tunnel_command

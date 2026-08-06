@@ -3,6 +3,7 @@ import {createRoot} from "react-dom/client";
 
 import {PublicApp} from "./PublicApp";
 import "./index.css";
+import {PublicRouter} from "./router";
 
 const root = document.getElementById("root");
 
@@ -12,6 +13,8 @@ if (!root) {
 
 createRoot(root).render(
   <StrictMode>
-    <PublicApp />
+    <PublicRouter>
+      <PublicApp />
+    </PublicRouter>
   </StrictMode>,
 );

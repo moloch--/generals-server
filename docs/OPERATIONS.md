@@ -12,16 +12,20 @@ can front the control listener, but it cannot replace the UDP port; preserve the
 original long-lived TCP connection and route UDP directly to the same server
 process.
 
-TCP 8082 exposes the read-only public website and its snapshot API. Publish it
-only when the public site is wanted by passing `--public-web-listen=:8082`;
-the listener is disabled by default. TCP 8082 is a separate HTTP server from
-both operations and administration.
+The production container publishes HTTPS TCP 443 to the independent public TLS
+listener on container TCP 8443. Public HTTP TCP 80 maps to a separate minimal
+listener on container TCP 8083, which redirects only recognized public GET and
+HEAD routes to the configured canonical HTTPS hostname. Do not publish a raw
+TCP 8082 origin. Both public listeners are disabled unless explicitly
+configured, and neither shares a route table with operations or administration.
 
 The optional admin listener exposes an embedded web dashboard and REST API.
 Keep it on a private management interface. The Compose deployment publishes
 TCP 8081 only on `GENERALS_ADMIN_HOST`, which should be the exact IPv4 address
 reported by `tailscale ip -4`. A plain `8081:8081` mapping is unsafe because it
-binds every host interface.
+binds every host interface. If direct access outside that private network is
+required, enable admin TLS and restrict the host firewall to exact operator
+IPv4 `/32` addresses.
 
 Set `--public-host` to a DNS name resolvable by every player. This value is sent
 in per-player `game.started` events. It may differ from the control listener's
@@ -54,6 +58,24 @@ generals-server \
 Both files are required. The server accepts TLS 1.2 or newer. Certificate
 renewal currently requires a process restart. Limit private-key read access to
 the service account.
+
+The public website and admin listener have independent paired TLS flags. The
+same managed certificate files may be reused when their DNS names match:
+
+```bash
+generals-server \
+  --public-web-listen :8443 \
+  --public-web-tls-cert /etc/generals-server/tls/fullchain.pem \
+  --public-web-tls-key /etc/generals-server/tls/privkey.pem \
+  --public-web-redirect-listen :8083 \
+  --public-web-canonical-host online.example.net
+```
+
+Supplying only one public certificate path, or configuring the redirect
+listener without both the TLS listener and canonical hostname, fails startup.
+Admin HTTPS similarly requires both `--admin-tls-cert` and
+`--admin-tls-key`. Admin authentication and its listener remain independent
+from the public TLS and redirect servers.
 
 The initial raw-TCP game adapter can use guest profiles on a plaintext local
 server. For a trusted development network only, opt in to password auth with
@@ -125,8 +147,8 @@ docker compose up --build -d
 The TLS copy commands are mandatory: Compose intentionally refuses to create
 or populate the configured TLS directory. To issue a Let's Encrypt IP
 certificate instead of copying an existing certificate, first create the ACME
-state volume and request the short-lived certificate while public TCP port 80
-is free:
+state volume and request the short-lived certificate before starting Compose,
+while public TCP port 80 is free:
 
 ```bash
 docker volume create generals-server-letsencrypt
@@ -147,7 +169,10 @@ Set the same certificate name in `.env`. Replace the example email and IP; for
 a DNS certificate, use Certbot's `--domains` option instead. The renewal script
 uses the existing Certbot lineage, atomically refreshes the private host TLS
 directory, preserves mode `0600` and the configured host ownership, and
-restarts the Compose container only when the certificate changed.
+briefly stops only the `generals-server` Compose service so standalone Certbot
+can bind TCP 80. An exit trap restores that service after success, failure, or
+interruption. A successful renewal therefore causes a short public/gameplay
+outage; use a DNS-01 renewal flow when even that interruption is unacceptable.
 
 Install the script in the service user's crontab. Logging through `logger`
 keeps output under the host journal's rotation policy instead of appending to
@@ -166,9 +191,12 @@ docker compose restart
 docker compose down
 ```
 
-The compose definition publishes the read-only website on TCP `8082`,
-operations HTTP on host loopback only, and the admin service on the exact
-Tailscale IPv4 address only. It drops Linux
+The compose definition publishes host TCP `443` to the public TLS listener on
+container TCP `8443` and host TCP `80` to the strict redirect listener on
+container TCP `8083`. It does not expose an additional origin port. Operations
+HTTP stays on host loopback, and the admin service stays on the exact Tailscale
+IPv4 address unless admin TLS and an exact-source firewall rule are deliberately
+configured. It drops Linux
 capabilities, uses a read-only container filesystem, and bind-mounts
 `GENERALS_DATA_DIR` at `/data`. It runs as `GENERALS_UID:GENERALS_GID`, so
 `profiles.db` and any WAL sidecars remain owned and directly accessible by the
@@ -188,7 +216,12 @@ isolated server process.
 Start the public listener explicitly:
 
 ```bash
-generals-server --public-web-listen :8082
+generals-server \
+  --public-web-listen :8443 \
+  --public-web-tls-cert /etc/generals-server/tls/fullchain.pem \
+  --public-web-tls-key /etc/generals-server/tls/privkey.pem \
+  --public-web-redirect-listen :8083 \
+  --public-web-canonical-host online.example.net
 ```
 
 The website is available at `/`. Its sole JSON endpoint is
@@ -199,13 +232,18 @@ include account usernames, credentials, admin bearer material, relay secrets,
 or mutation controls.
 
 The public and admin servers do not share a route table. Requests for
-`/admin/` or `/api/admin/v1/*` on TCP `8082` return not found, including requests
-that send an otherwise valid admin bearer token. The public API accepts no
-cross-origin requests and provides no state-changing method.
+`/admin/` or `/api/admin/v1/*` on the public TLS listener return not found,
+including requests that send an otherwise valid admin bearer token. The HTTP
+redirect listener also refuses those paths without a `Location` header. It
+redirects only GET or HEAD requests for the website, its five routed pages,
+canonical assets, the icon, and `GET /api/public/v1/snapshot`; unknown,
+noncanonical, private, and mutating requests return not found. The public API
+accepts no cross-origin requests and provides no state-changing method.
 
-Public TCP `8082` is plain HTTP in the supplied direct-listener deployment. If
-transport encryption for the website is required, place an HTTPS reverse proxy
-in front of TCP `8082`; keep the admin listener on its separate private binding.
+The redirect target always uses the configured canonical hostname rather than
+the untrusted request `Host`, and preserves the accepted request path and query.
+The supplied Compose mapping exposes only host TCP `443` and `80`; container
+TCP `8443` and `8083` are implementation ports, not additional public origins.
 
 ## Admin dashboard and REST API
 
@@ -217,9 +255,24 @@ generals-server \
   --admin-token-file /etc/generals-server/admin-token
 ```
 
+For HTTPS admin access, add both certificate paths:
+
+```bash
+  --admin-tls-cert /etc/generals-server/tls/fullchain.pem \
+  --admin-tls-key /etc/generals-server/tls/privkey.pem
+```
+
+The Compose equivalents are `GENERALS_ADMIN_TLS_CERT` and
+`GENERALS_ADMIN_TLS_KEY`, normally set to `/tls/fullchain.pem` and
+`/tls/privkey.pem`. Leave both empty for private HTTP access. If admin is bound
+to all host IPv4 interfaces, require HTTPS, permit TCP 8081 only from exact
+operator `/32` addresses, and use the certificate DNS name rather than its IP
+address in the browser.
+
 The web interface is available at `/admin/`. Its JavaScript, CSS, and HTML are
-compiled into `internal/app/adminui/dist` and embedded directly in the Go
-binary with `embed.FS`; there is no runtime web directory to mount or manage.
+generated into the Git-ignored `internal/app/adminui/dist` tree during the
+build and embedded directly in the Go binary with `embed.FS`; there is no
+runtime web directory to mount or manage.
 The login screen retains the bearer token only in the current browser tab's
 `sessionStorage`.
 
@@ -259,6 +312,8 @@ From another device on the same tailnet, open:
 http://<tailscale-name-or-ip>:8081/admin/
 ```
 
+Use `https://<certificate-name>:8081/admin/` when admin TLS is enabled.
+
 No public firewall port is required for this listener. Verify the host binding
 after deployment with `docker compose ps` and `ss -ltn`; it must show the
 Tailscale address, not `0.0.0.0:8081` or `[::]:8081`.
@@ -280,15 +335,17 @@ sudo systemctl enable --now generals-server
 Create the locked-down `generals-server` system user and install readable TLS
 files before starting the unit. The service uses systemd's `StateDirectory` for
 the SQLite database and its WAL sidecars, binds health checks to loopback, and
-enables only the read-only public website on TCP `8082`. Admin remains disabled
+enables the read-only public TLS listener on TCP `8443` plus its strict redirect
+listener on TCP `8083`. Map external TCP `443` and `80` to those unprivileged
+ports with the host firewall or an equivalent edge. Admin remains disabled
 until both private admin flags are added deliberately.
 
 ## Monitoring
 
 Use `GET /healthz` or `GET /readyz` for process health. Both return live control
 and relay addresses, player/game gauges, and UDP counters. `GET /metrics`
-returns Prometheus text. Query `GET /api/public/v1/snapshot` through TCP `8082`
-to verify the independently routed public service.
+returns Prometheus text. Query `GET /api/public/v1/snapshot` through public
+HTTPS TCP `443` to verify the independently routed public service.
 
 Important signals:
 

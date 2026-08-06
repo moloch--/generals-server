@@ -2,6 +2,7 @@ package app
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"strconv"
 	"strings"
@@ -14,7 +15,13 @@ type Config struct {
 	HealthAddr                string
 	AdminAddr                 string
 	AdminTokenFile            string
+	AdminTLSCertFile          string
+	AdminTLSKeyFile           string
 	PublicWebAddr             string
+	PublicWebTLSCertFile      string
+	PublicWebTLSKeyFile       string
+	PublicWebRedirectAddr     string
+	PublicWebCanonicalHost    string
 	PublicHost                string
 	PublicRelayPort           int
 	DataFile                  string
@@ -61,19 +68,57 @@ func DefaultConfig() Config {
 	}
 }
 
-// GeneralsX @feature OpenAI 06/08/2026 Keep the public web listener off every private HTTP port.
+// GeneralsX @feature OpenAI 06/08/2026 Keep every public web listener off the private HTTP ports.
 func validatePublicWebListenerPorts(cfg Config) error {
 	publicPort, enabled := configuredNonzeroTCPPort(cfg.PublicWebAddr)
-	if !enabled {
-		return nil
+	redirectPort, redirectEnabled := configuredNonzeroTCPPort(cfg.PublicWebRedirectAddr)
+	adminPort, adminEnabled := configuredNonzeroTCPPort(cfg.AdminAddr)
+	healthPort, healthEnabled := configuredNonzeroTCPPort(cfg.HealthAddr)
+	if enabled {
+		if adminEnabled && adminPort == publicPort {
+			return errors.New("public web and admin listeners must use different nonzero TCP ports")
+		}
+		if healthEnabled && healthPort == publicPort {
+			return errors.New("public web and health listeners must use different nonzero TCP ports")
+		}
 	}
-	if adminPort, ok := configuredNonzeroTCPPort(cfg.AdminAddr); ok && adminPort == publicPort {
-		return errors.New("public web and admin listeners must use different nonzero TCP ports")
-	}
-	if healthPort, ok := configuredNonzeroTCPPort(cfg.HealthAddr); ok && healthPort == publicPort {
-		return errors.New("public web and health listeners must use different nonzero TCP ports")
+	if redirectEnabled {
+		if enabled && redirectPort == publicPort {
+			return errors.New("public web and redirect listeners must use different nonzero TCP ports")
+		}
+		if adminEnabled && redirectPort == adminPort {
+			return errors.New("public web redirect and admin listeners must use different nonzero TCP ports")
+		}
+		if healthEnabled && redirectPort == healthPort {
+			return errors.New("public web redirect and health listeners must use different nonzero TCP ports")
+		}
 	}
 	return nil
+}
+
+func validatePublicWebConfiguration(cfg Config) error {
+	if (cfg.PublicWebTLSCertFile == "") != (cfg.PublicWebTLSKeyFile == "") {
+		return errors.New("both --public-web-tls-cert and --public-web-tls-key are required when public web TLS is enabled")
+	}
+	if cfg.PublicWebTLSCertFile != "" && cfg.PublicWebAddr == "" {
+		return errors.New("--public-web-tls-cert and --public-web-tls-key require the public web server to be enabled")
+	}
+	if cfg.PublicWebRedirectAddr == "" {
+		if cfg.PublicWebCanonicalHost != "" {
+			return errors.New("--public-web-canonical-host requires --public-web-redirect-listen")
+		}
+		return validatePublicWebListenerPorts(cfg)
+	}
+	if cfg.PublicWebAddr == "" {
+		return errors.New("--public-web-redirect-listen requires the public web server to be enabled")
+	}
+	if cfg.PublicWebTLSCertFile == "" {
+		return errors.New("--public-web-redirect-listen requires public web TLS")
+	}
+	if err := validatePublicHost(cfg.PublicWebCanonicalHost); err != nil {
+		return fmt.Errorf("invalid public web canonical host: %w", err)
+	}
+	return validatePublicWebListenerPorts(cfg)
 }
 
 func configuredNonzeroTCPPort(address string) (int, bool) {

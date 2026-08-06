@@ -101,7 +101,7 @@ if [[ -z "$filesystem_type" ]]; then
     echo "refusing to format an EBS volume with an unrecognized signature" >&2
     exit 1
   fi
-  mkfs.xfs -L generals-data "$data_device"
+  mkfs.xfs -L generalsdata "$data_device"
 elif [[ "$filesystem_type" != xfs ]]; then
   echo "retained EBS volume must contain XFS, found $filesystem_type" >&2
   exit 1

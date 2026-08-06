@@ -101,7 +101,10 @@ data "aws_iam_policy_document" "server" {
     condition {
       test     = "ForAllValues:StringEquals"
       variable = "route53:ChangeResourceRecordSetsNormalizedRecordNames"
-      values   = ["_acme-challenge.${var.hostname}"]
+      values = [
+        "_acme-challenge.${var.hostname}",
+        "_acme-challenge.${var.public_hostname}",
+      ]
     }
   }
 }
@@ -116,4 +119,3 @@ resource "aws_iam_instance_profile" "server" {
   name = local.name_prefix
   role = aws_iam_role.server.name
 }
-

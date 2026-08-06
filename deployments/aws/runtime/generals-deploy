@@ -15,8 +15,28 @@ aws_region=$(printf '%s' "$AWS_REGION_B64" | base64 --decode)
 desired_image_parameter=$(printf '%s' "$DESIRED_IMAGE_PARAMETER_B64" | base64 --decode)
 expected_repository=$(printf '%s' "$ECR_REPOSITORY_URL_B64" | base64 --decode)
 hostname=$(printf '%s' "$HOSTNAME_B64" | base64 --decode)
+public_hostname=$(printf '%s' "$PUBLIC_HOSTNAME_B64" | base64 --decode)
+admin_bind_host=$(printf '%s' "$ADMIN_BIND_HOST_B64" | base64 --decode)
+admin_tls_cert=$(printf '%s' "$ADMIN_TLS_CERT_B64" | base64 --decode)
+admin_tls_key=$(printf '%s' "$ADMIN_TLS_KEY_B64" | base64 --decode)
 platform=$(printf '%s' "$GENERALS_PLATFORM_B64" | base64 --decode)
 log_group=$(printf '%s' "$CLOUDWATCH_LOG_GROUP_B64" | base64 --decode)
+
+case "$admin_bind_host" in
+  127.0.0.1)
+    [[ -z "$admin_tls_cert" && -z "$admin_tls_key" ]] || {
+      echo "loopback admin must not configure TLS files" >&2
+      exit 1
+    }
+    ;;
+  0.0.0.0)
+    [[ "$admin_tls_cert" == /tls/fullchain.pem && "$admin_tls_key" == /tls/privkey.pem ]] || {
+      echo "public admin must use the managed TLS certificate and key" >&2
+      exit 1
+    }
+    ;;
+  *) echo "admin bind host must be loopback or all IPv4 interfaces" >&2; exit 1 ;;
+esac
 
 desired_image=$(aws ssm get-parameter \
   --region "$aws_region" \
@@ -76,6 +96,10 @@ CLOUDWATCH_LOG_GROUP=$log_group
 GENERALS_IMAGE=$desired_image
 GENERALS_PLATFORM=$platform
 GENERALS_PUBLIC_HOST=$hostname
+GENERALS_PUBLIC_WEB_HOST=$public_hostname
+GENERALS_ADMIN_HOST=$admin_bind_host
+GENERALS_ADMIN_TLS_CERT=$admin_tls_cert
+GENERALS_ADMIN_TLS_KEY=$admin_tls_key
 EOF
 chmod 0600 "$temporary_file"
 

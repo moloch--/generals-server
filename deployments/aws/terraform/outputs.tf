@@ -8,9 +8,14 @@ output "public_ip" {
   value       = aws_eip.server.public_ip
 }
 
-output "public_hostname" {
+output "gameplay_hostname" {
   description = "Player-facing TLS hostname."
   value       = aws_route53_record.server.fqdn
+}
+
+output "public_hostname" {
+  description = "Browser-facing HTTPS hostname."
+  value       = aws_route53_record.public_web.fqdn
 }
 
 output "online_endpoint" {
@@ -20,7 +25,7 @@ output "online_endpoint" {
 
 output "public_web_url" {
   description = "Public status, leaderboard, players, lobbies, and active-games web interface."
-  value       = "http://${var.hostname}:8082/"
+  value       = "https://${var.public_hostname}/"
 }
 
 output "instance_id" {

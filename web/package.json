@@ -4,7 +4,6 @@
   "private": true,
   "type": "module",
   "allowScripts": {
-    "@heroui-pro/react@1.0.0-beta.7": true,
     "@zowe/secrets-for-zowe-sdk": false,
     "fsevents": false
   },
@@ -22,7 +21,6 @@
     "@fortawesome/fontawesome-svg-core": "7.3.1",
     "@fortawesome/free-solid-svg-icons": "7.3.1",
     "@fortawesome/react-fontawesome": "3.5.0",
-    "@heroui-pro/react": "1.0.0-beta.7",
     "@heroui/react": "3.2.3",
     "@heroui/styles": "3.2.3",
     "@number-flow/react": "^0.6.2",

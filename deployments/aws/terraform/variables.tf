@@ -53,7 +53,7 @@ variable "environment" {
 }
 
 variable "hostname" {
-  description = "Public lowercase FQDN used by clients and the ACME certificate."
+  description = "Public lowercase gameplay FQDN used by clients and the ACME certificate."
   type        = string
 
   validation {
@@ -65,8 +65,21 @@ variable "hostname" {
   }
 }
 
+variable "public_hostname" {
+  description = "Public lowercase FQDN for the HTTPS website and canonical HTTP redirect target."
+  type        = string
+
+  validation {
+    condition = (
+      length(var.public_hostname) <= 253 &&
+      can(regex("^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", var.public_hostname))
+    )
+    error_message = "public_hostname must be a lowercase RFC 1123-style fully qualified domain name."
+  }
+}
+
 variable "route53_zone_id" {
-  description = "ID of the existing public Route 53 hosted zone containing hostname."
+  description = "ID of the existing public Route 53 hosted zone containing hostname and public_hostname."
   type        = string
 
   validation {
@@ -99,7 +112,7 @@ variable "allowed_gameplay_ipv4_cidrs" {
 }
 
 variable "allowed_public_web_ipv4_cidrs" {
-  description = "IPv4 CIDRs allowed to reach the public TCP 8082 web interface."
+  description = "IPv4 CIDRs allowed to reach the public HTTPS interface on TCP 443 and HTTP redirect on TCP 80."
   type        = set(string)
   default     = ["0.0.0.0/0"]
 
@@ -108,6 +121,19 @@ variable "allowed_public_web_ipv4_cidrs" {
       for cidr in var.allowed_public_web_ipv4_cidrs : can(cidrnetmask(cidr)) && can(regex("\\.", cidr))
     ])
     error_message = "allowed_public_web_ipv4_cidrs must contain valid IPv4 CIDR blocks."
+  }
+}
+
+variable "allowed_admin_ipv4_cidrs" {
+  description = "Exact public IPv4 hosts allowed to reach the HTTPS admin interface on TCP 8081. An empty set keeps admin bound to host loopback."
+  type        = set(string)
+  default     = []
+
+  validation {
+    condition = alltrue([
+      for cidr in var.allowed_admin_ipv4_cidrs : can(cidrnetmask(cidr)) && can(regex("\\.", cidr)) && endswith(cidr, "/32")
+    ])
+    error_message = "allowed_admin_ipv4_cidrs must contain only valid IPv4 /32 host CIDRs."
   }
 }
 

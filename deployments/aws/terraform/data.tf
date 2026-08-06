@@ -58,6 +58,16 @@ check "hostname_in_public_zone" {
   }
 }
 
+check "public_hostname_in_public_zone" {
+  assert {
+    condition = (
+      var.public_hostname != var.hostname &&
+      (var.public_hostname == local.hosted_zone_name || endswith(var.public_hostname, ".${local.hosted_zone_name}"))
+    )
+    error_message = "public_hostname must differ from hostname and equal or be a child of the selected public Route 53 hosted zone."
+  }
+}
+
 check "instance_architecture" {
   assert {
     condition     = contains(data.aws_ec2_instance_type.selected.supported_architectures, var.architecture)

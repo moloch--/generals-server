@@ -1,13 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+source /etc/generals-server/deployment.env
+
+: "${GENERALS_PUBLIC_WEB_HOST:?deployment environment must set GENERALS_PUBLIC_WEB_HOST}"
+public_snapshot_url="https://$GENERALS_PUBLIC_WEB_HOST/api/public/v1/snapshot"
+redirect_probe_url="http://127.0.0.1/leaderboard?probe=readiness"
+expected_redirect_url="https://$GENERALS_PUBLIC_WEB_HOST/leaderboard?probe=readiness"
+
 for _ in $(seq 1 30); do
   if curl --fail --silent --show-error --max-time 2 http://127.0.0.1:8080/readyz >/dev/null &&
-    curl --fail --silent --show-error --max-time 2 http://127.0.0.1:8082/api/public/v1/snapshot >/dev/null; then
-    exit 0
+    curl --fail --silent --show-error --max-time 2 \
+      --resolve "$GENERALS_PUBLIC_WEB_HOST:443:127.0.0.1" \
+      "$public_snapshot_url" >/dev/null; then
+    if redirect_url=$(curl --silent --show-error --max-time 2 \
+      --output /dev/null --write-out '%{redirect_url}' \
+      "$redirect_probe_url"); then
+      if [[ "$redirect_url" == "$expected_redirect_url" ]]; then
+        exit 0
+      fi
+    fi
   fi
   sleep 1
 done
 
-echo "generals-server health or public web listener did not become ready within 30 seconds" >&2
+echo "generals-server health, HTTPS public web, or HTTP redirect listener did not become ready within 30 seconds" >&2
 exit 1

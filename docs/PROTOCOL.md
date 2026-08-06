@@ -11,7 +11,9 @@ Default ports:
 | Control | TCP or TLS-over-TCP | `29900` |
 | Gameplay relay | UDP | `27901` |
 | Health and metrics | HTTP | `8080` |
-| Public website and snapshot | HTTP | `8082` (opt-in) |
+| Public website and snapshot | HTTPS | `443` (opt-in production mapping) |
+| Public HTTPS redirect | HTTP | `80` (opt-in production mapping) |
+| Administration | HTTP or HTTPS | `8081` (opt-in and private/allowlisted) |
 
 The game command-line flag `-onlineServer <endpoint>` selects the control
 endpoint. `tls://host[:control-port]` requires verified TLS and enables
@@ -551,12 +553,23 @@ to a private monitoring interface.
 
 The separately configured public listener exposes the website at `/` and one
 read-only endpoint, `GET /api/public/v1/snapshot`. It is disabled until
-`--public-web-listen` is set; the supplied deployments bind it to TCP `8082`.
+`--public-web-listen` is set. The supplied production containers bind it with
+TLS on container TCP `8443` and publish it as host TCP `443`; both
+`--public-web-tls-cert` and `--public-web-tls-key` are required for that mode.
 The public snapshot describes service status, leaderboard entries, online
 players, joinable lobbies, and active games using bounded public display data.
-TCP `8082` is plaintext origin HTTP; Internet deployments should terminate
-HTTPS on a public reverse proxy before forwarding requests to this listener.
+Those views and the static How to play guide use exact client-side routes while
+sharing the same embedded application shell; no catch-all server route is used.
+
+A distinct listener configured with `--public-web-redirect-listen=:8083` is
+published as host TCP `80`. It returns a permanent HTTPS redirect only for GET
+and HEAD requests on the strict public route allowlist. The target is built
+from `--public-web-canonical-host`, never the request `Host`, and preserves the
+accepted path and query. Unknown, noncanonical, mutating, health, metrics, and
+admin paths return not found without a `Location` header.
 
 Admin routes are not part of this listener. `/admin/` and
 `/api/admin/v1/*` are served only by the independently configured private admin
-server on TCP `8081` in the supplied deployments.
+server on TCP `8081` in the supplied deployments. Admin TLS is separately
+enabled only when both `--admin-tls-cert` and `--admin-tls-key` are provided;
+it never changes the public handler or redirect allowlist.

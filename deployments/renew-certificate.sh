@@ -8,10 +8,21 @@ umask 077
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 if [ -f "$script_dir/.env" ]; then
   deployment_dir=$script_dir
+  environment_file=$script_dir/.env
 elif [ -f "$script_dir/../.env" ]; then
   deployment_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
+  environment_file=$deployment_dir/.env
 else
   echo "renew-certificate: cannot find .env beside the script or in its parent" >&2
+  exit 1
+fi
+
+if [ -f "$deployment_dir/compose.yaml" ]; then
+  compose_file=$deployment_dir/compose.yaml
+elif [ -f "$script_dir/../compose.yaml" ]; then
+  compose_file=$(CDPATH= cd -- "$script_dir/.." && pwd)/compose.yaml
+else
+  echo "renew-certificate: cannot find compose.yaml for the deployment" >&2
   exit 1
 fi
 
@@ -39,7 +50,13 @@ esac
 
 certbot_image=${GENERALS_CERTBOT_IMAGE:-certbot/certbot:v5.4.0}
 acme_volume=${GENERALS_ACME_VOLUME:-generals-server-letsencrypt}
-server_container=${GENERALS_CONTAINER_NAME:-generals-server}
+
+compose() {
+  docker compose \
+    --env-file "$environment_file" \
+    --file "$compose_file" \
+    "$@"
+}
 
 test -d "$GENERALS_TLS_DIR"
 actual_uid=$(stat -c %u "$GENERALS_TLS_DIR")
@@ -60,6 +77,29 @@ echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) checking certificate renewal"
 old_hash=
 if [ -f "$GENERALS_TLS_DIR/fullchain.pem" ]; then
   old_hash=$(sha256sum "$GENERALS_TLS_DIR/fullchain.pem" | cut -d " " -f 1)
+fi
+
+server_was_running=false
+restore_server() {
+  status=$?
+  trap - EXIT HUP INT TERM
+  if [ "$server_was_running" = true ]; then
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) restoring generals-server service"
+    if ! compose start generals-server >/dev/null; then
+      echo "renew-certificate: failed to restore generals-server service" >&2
+      status=1
+    fi
+  fi
+  exit "$status"
+}
+trap restore_server EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if compose ps --status running --services generals-server | grep -qx generals-server; then
+  server_was_running=true
+  compose stop --timeout 15 generals-server
 fi
 
 docker run --rm \
@@ -90,9 +130,8 @@ docker run --rm \
 
 new_hash=$(sha256sum "$GENERALS_TLS_DIR/fullchain.pem" | cut -d " " -f 1)
 
-if [ "$new_hash" != "$old_hash" ] && docker container inspect "$server_container" >/dev/null 2>&1; then
-  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) certificate changed; restarting $server_container"
-  docker restart --time 15 "$server_container" >/dev/null
+if [ "$new_hash" != "$old_hash" ]; then
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) certificate changed"
 else
   echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) certificate unchanged"
 fi

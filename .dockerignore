@@ -7,6 +7,9 @@ data
 tls
 web/.heroui
 web/node_modules
+web/dist
+internal/app/adminui/dist
+internal/app/publicui/dist
 *.log
 *.test
 *.exe
