@@ -24,6 +24,7 @@ type onlineServer interface {
 	RelayAddress() string
 	HealthAddress() string
 	AdminAddress() string
+	PublicWebAddress() string
 	Errors() <-chan error
 }
 
@@ -92,6 +93,7 @@ func newRootCommand(runner *commandRunner) *cobra.Command {
 	flags.StringVar(&cfg.HealthAddr, "health-listen", cfg.HealthAddr, "HTTP health/metrics listen address")
 	flags.StringVar(&cfg.AdminAddr, "admin-listen", cfg.AdminAddr, "HTTP admin API and web interface listen address (disabled by default)")
 	flags.StringVar(&cfg.AdminTokenFile, "admin-token-file", cfg.AdminTokenFile, "file containing the admin bearer token")
+	flags.StringVar(&cfg.PublicWebAddr, "public-web-listen", cfg.PublicWebAddr, "HTTP public web interface listen address (disabled by default)")
 	flags.StringVar(&cfg.PublicHost, "public-host", cfg.PublicHost, "public relay hostname advertised to clients")
 	flags.IntVar(&cfg.PublicRelayPort, "public-relay-port", cfg.PublicRelayPort, "public UDP relay port advertised to clients (zero uses the bound port)")
 	flags.StringVar(&cfg.DataFile, "data-file", cfg.DataFile, "SQLite profile database path")
@@ -175,6 +177,7 @@ func (runner *commandRunner) run(ctx context.Context, cfg app.Config) {
 		"relay", server.RelayAddress(),
 		"health", server.HealthAddress(),
 		"admin", server.AdminAddress(),
+		"public_web", server.PublicWebAddress(),
 		"public_host", cfg.PublicHost,
 	)
 

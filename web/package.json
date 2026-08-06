@@ -10,8 +10,13 @@
   },
   "scripts": {
     "dev": "vite",
+    "dev:admin": "vite",
+    "dev:public": "vite --config vite.public.config.ts --open /public.html",
     "typecheck": "tsc --noEmit",
-    "build": "npm run typecheck && vite build"
+    "build:admin": "vite build",
+    "build:public": "vite build --config vite.public.config.ts",
+    "build": "npm run typecheck && npm run build:admin",
+    "build:all": "npm run typecheck && npm run build:admin && npm run build:public"
   },
   "dependencies": {
     "@fortawesome/fontawesome-svg-core": "7.3.1",

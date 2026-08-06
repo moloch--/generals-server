@@ -21,6 +21,8 @@ the complete wire contract and production details, see:
 - a slot-aware UDP relay for opaque retail game traffic;
 - transactional SQLite profile, relationship, and statistics storage;
 - JSON health/readiness endpoints and Prometheus metrics;
+- a public read-only website for service status, leaderboards, online players,
+  open lobbies, and active games;
 - a private bearer-authenticated admin dashboard with live WebSocket updates,
   session and lobby controls, profile search, password reset, and profile
   deletion.
@@ -51,7 +53,8 @@ For the supplied production deployment:
 - Docker Engine with Docker Compose v2;
 - a player-resolvable DNS name or public IPv4 address;
 - a TLS certificate and private key for the control listener;
-- inbound TCP `29900` and UDP `27901` forwarded to the same host;
+- inbound TCP `29900`, UDP `27901`, and public web TCP `8082` forwarded to the
+  same host;
 - Tailscale, or an equivalent private management network, for the admin UI.
 
 ## Local quick start
@@ -63,6 +66,7 @@ go run ./cmd/generals-server \
   --control-listen 127.0.0.1:29900 \
   --relay-listen 127.0.0.1:27901 \
   --health-listen 127.0.0.1:8080 \
+  --public-web-listen 127.0.0.1:8082 \
   --public-host 127.0.0.1
 ```
 
@@ -70,6 +74,7 @@ Check readiness:
 
 ```bash
 curl -fsS http://127.0.0.1:8080/readyz
+curl -fsS http://127.0.0.1:8082/api/public/v1/snapshot
 ```
 
 Start the game with this endpoint (`--onlineServer` is also accepted):
@@ -91,7 +96,8 @@ The default SQLite database is `data/profiles.db`. Override it with
 
 The supplied [Compose file](compose.yaml) is the recommended deployment. It
 publishes gameplay ports publicly, binds health/metrics to host loopback, and
-binds the admin service only to one exact private IPv4 address.
+binds the admin service only to one exact private IPv4 address. The read-only
+public website is published separately on TCP `8082`.
 
 For a cost-conscious AWS installation, the
 [Terraform deployment](deployments/aws/README.md) provisions one containerized
@@ -162,6 +168,7 @@ docker compose config --quiet
 docker compose up --build -d
 docker compose ps
 curl -fsS http://127.0.0.1:8080/readyz
+curl -fsS http://127.0.0.1:8082/api/public/v1/snapshot
 ```
 
 Follow logs with:
@@ -178,10 +185,36 @@ docker compose logs -f
 | UDP `27901` | Public | Authenticated game-packet relay |
 | TCP `8080` | Loopback or private monitoring only | Health, readiness, and Prometheus metrics |
 | TCP `8081` | Exact Tailscale/private address only | Admin REST API, dashboard, and WebSocket stream |
+| TCP `8082` | Public | Read-only website and public snapshot API |
 
 If NAT maps a different external UDP port to local UDP `27901`, set that
 external port with `--public-relay-port`. Do not publish TCP `8080` or `8081`
 on the public firewall.
+
+## Browse the public website
+
+Open the read-only public interface at:
+
+```text
+http://online.example.net:8082/
+```
+
+TCP `8082` is a plaintext origin HTTP listener. For an Internet-facing website,
+terminate HTTPS on a reverse proxy (normally TCP `443`) and forward only the
+public origin traffic to TCP `8082`; do not route admin TCP `8081` through that
+public proxy. The direct `:8082` URL is appropriate for local access and origin
+smoke tests.
+
+It presents service status, the leaderboard, online players, joinable lobbies,
+and active games from the same process that owns the live Online state. Its only
+JSON endpoint is `GET /api/public/v1/snapshot`; all returned collections are
+bounded and contain public display data rather than account usernames or admin
+controls.
+
+The public listener is disabled unless `--public-web-listen` is set. It runs on
+an independent HTTP server and route table: `/admin/` and every
+`/api/admin/v1/*` path are unavailable on TCP `8082`, even when a request sends
+an admin bearer token. Keep TCP `8081` on the private management network.
 
 ## Connect players
 
@@ -262,6 +295,7 @@ docker compose build --pull
 docker compose up -d
 docker compose ps
 curl -fsS http://127.0.0.1:8080/readyz
+curl -fsS http://127.0.0.1:8082/api/public/v1/snapshot
 ```
 
 Schedule restarts outside active matches. Profiles and stats remain in SQLite,
@@ -287,6 +321,7 @@ CGO_ENABLED=0 go build -trimpath \
   --control-listen :29900 \
   --relay-listen :27901 \
   --health-listen 127.0.0.1:8080 \
+  --public-web-listen :8082 \
   --public-host online.example.net \
   --tls-cert /etc/generals-server/tls/fullchain.pem \
   --tls-key /etc/generals-server/tls/privkey.pem \
@@ -296,8 +331,9 @@ CGO_ENABLED=0 go build -trimpath \
 The supplied [systemd unit](deployments/generals-server.service) and its
 installation steps are documented in the
 [operations guide](docs/OPERATIONS.md#systemd-deployment). The unit
-intentionally leaves the admin service disabled; add both admin flags and a
-private token file if you enable it.
+enables the read-only public site on TCP `8082` and intentionally leaves the
+admin service disabled; add both admin flags and a private token file if you
+enable it.
 
 ## Development and verification
 
@@ -313,16 +349,21 @@ CGO_ENABLED=0 go build -trimpath -o bin/generals-server ./cmd/generals-server
 The integration suite exercises real control sockets, authentication, rooms,
 game staging, start coordination, and bidirectional UDP relay traffic.
 
-The authored admin application is in `web/`; its checked-in production output
-is embedded from `internal/app/adminui/dist` by the Go standard library. To
-regenerate it after a frontend change:
+The authored admin and public applications are in `web/`; their checked-in
+production output is embedded from `internal/app/adminui/dist` and
+`internal/app/publicui/dist` by the Go standard library. To regenerate the
+public application after a frontend change:
 
 ```bash
 cd web
 npm ci
 npm run typecheck
-npm run build
+npm run build:public
 ```
+
+Use `npm run build:admin` (or the existing `npm run build`) for an admin-only
+change, or `npm run build:all` when both applications intentionally need to be
+rebuilt.
 
 Normal Go and Docker builds use the checked-in generated assets and do not need
 Node or frontend package credentials. Frontend development requires access to

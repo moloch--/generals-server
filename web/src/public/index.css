@@ -2,12 +2,16 @@
 @import "@heroui/styles";
 @import "@heroui-pro/react/css";
 
-@source "./*.{ts,tsx}";
+@source "./**/*.{ts,tsx}";
 
 :root {
   color-scheme: dark;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
+}
+
+html {
+  scroll-behavior: smooth;
 }
 
 html,
@@ -24,7 +28,12 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-button,
-input {
+button {
   font: inherit;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
 }

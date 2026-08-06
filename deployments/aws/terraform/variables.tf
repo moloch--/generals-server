@@ -98,6 +98,19 @@ variable "allowed_gameplay_ipv4_cidrs" {
   }
 }
 
+variable "allowed_public_web_ipv4_cidrs" {
+  description = "IPv4 CIDRs allowed to reach the public TCP 8082 web interface."
+  type        = set(string)
+  default     = ["0.0.0.0/0"]
+
+  validation {
+    condition = alltrue([
+      for cidr in var.allowed_public_web_ipv4_cidrs : can(cidrnetmask(cidr)) && can(regex("\\.", cidr))
+    ])
+    error_message = "allowed_public_web_ipv4_cidrs must contain valid IPv4 CIDR blocks."
+  }
+}
+
 variable "vpc_cidr" {
   description = "CIDR for the dedicated single-subnet VPC."
   type        = string

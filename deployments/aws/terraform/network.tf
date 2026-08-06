@@ -48,7 +48,7 @@ resource "aws_route_table_association" "public" {
 
 resource "aws_security_group" "server" {
   name        = local.name_prefix
-  description = "Public Generals control and relay traffic only"
+  description = "Public Generals control, relay, and read-only web traffic only"
   vpc_id      = aws_vpc.server.id
 
   tags = {
@@ -78,10 +78,20 @@ resource "aws_vpc_security_group_ingress_rule" "relay" {
   ip_protocol       = "udp"
 }
 
+resource "aws_vpc_security_group_ingress_rule" "public_web" {
+  for_each = var.allowed_public_web_ipv4_cidrs
+
+  security_group_id = aws_security_group.server.id
+  description       = "Generals public web interface"
+  cidr_ipv4         = each.value
+  from_port         = 8082
+  to_port           = 8082
+  ip_protocol       = "tcp"
+}
+
 resource "aws_vpc_security_group_egress_rule" "internet" {
   security_group_id = aws_security_group.server.id
   description       = "Host updates, ECR, SSM, logs, and ACME"
   cidr_ipv4         = "0.0.0.0/0"
   ip_protocol       = "-1"
 }
-

@@ -22,6 +22,8 @@ type Server struct {
 	control      *ControlServer
 	health       *http.Server
 	healthLn     net.Listener
+	publicWeb    *http.Server
+	publicWebLn  net.Listener
 	admin        *http.Server
 	adminLn      net.Listener
 	adminHandler *adminHandler
@@ -66,6 +68,9 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 	}
 	if cfg.ControlReadTimeout <= 0 || cfg.ControlWriteTimeout <= 0 {
 		return nil, errors.New("control read and write timeouts must be positive")
+	}
+	if err := validatePublicWebListenerPorts(cfg); err != nil {
+		return nil, err
 	}
 	if (cfg.AdminAddr == "") != (cfg.AdminTokenFile == "") {
 		return nil, errors.New("both --admin-listen and --admin-token-file are required when the admin server is enabled")
@@ -132,10 +137,28 @@ func (s *Server) Start(parent context.Context) error {
 		s.closed = true
 		return errors.Join(fmt.Errorf("listen for health requests: %w", err), s.store.Close())
 	}
+	// GeneralsX @feature OpenAI 06/08/2026 Own the public HTTP listener independently from private handlers.
+	var publicWebListener net.Listener
+	if s.cfg.PublicWebAddr != "" {
+		publicWebListener, err = net.Listen("tcp", s.cfg.PublicWebAddr)
+		if err != nil {
+			_ = listener.Close()
+			_ = s.control.Close()
+			_ = s.relay.Close()
+			cancel()
+			s.control.Wait()
+			s.closed = true
+			return errors.Join(fmt.Errorf("listen for public web requests: %w", err), s.store.Close())
+		}
+		s.publicWebLn = publicWebListener
+	}
 	var adminListener net.Listener
 	if s.cfg.AdminAddr != "" {
 		adminListener, err = net.Listen("tcp", s.cfg.AdminAddr)
 		if err != nil {
+			if publicWebListener != nil {
+				_ = publicWebListener.Close()
+			}
 			_ = listener.Close()
 			_ = s.control.Close()
 			_ = s.relay.Close()
@@ -158,6 +181,16 @@ func (s *Server) Start(parent context.Context) error {
 		IdleTimeout:       30 * time.Second,
 		MaxHeaderBytes:    16 * 1024,
 	}
+	if publicWebListener != nil {
+		s.publicWeb = &http.Server{
+			Handler:           newPublicHandler(s.hub, s.store, s.log),
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       10 * time.Second,
+			WriteTimeout:      10 * time.Second,
+			IdleTimeout:       30 * time.Second,
+			MaxHeaderBytes:    16 * 1024,
+		}
+	}
 	startedAt := time.Now().UTC()
 	if adminListener != nil {
 		s.adminLn = adminListener
@@ -177,6 +210,13 @@ func (s *Server) Start(parent context.Context) error {
 			reportRuntimeError(fmt.Errorf("serve health requests: %w", err))
 		}
 	}()
+	if s.publicWeb != nil {
+		go func() {
+			if err := s.publicWeb.Serve(publicWebListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				reportRuntimeError(fmt.Errorf("serve public web requests: %w", err))
+			}
+		}()
+	}
 	if s.admin != nil {
 		go func() {
 			if err := s.admin.Serve(adminListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -212,12 +252,19 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.cancel()
 	}
 	health := s.health
+	publicWeb := s.publicWeb
 	admin := s.admin
 	adminHandler := s.adminHandler
 	s.mu.Unlock()
 
 	var errs []error
 	if wasStarted {
+		if publicWeb != nil {
+			if err := publicWeb.Shutdown(ctx); err != nil {
+				errs = append(errs, err)
+				_ = publicWeb.Close()
+			}
+		}
 		if admin != nil {
 			if err := adminHandler.shutdownEvents(ctx); err != nil {
 				errs = append(errs, err)
@@ -269,6 +316,16 @@ func (s *Server) HealthAddress() string {
 		return s.healthLn.Addr().String()
 	}
 	return s.cfg.HealthAddr
+}
+
+// GeneralsX @feature OpenAI 06/08/2026 Report the independently bound public web address.
+func (s *Server) PublicWebAddress() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.publicWebLn != nil {
+		return s.publicWebLn.Addr().String()
+	}
+	return s.cfg.PublicWebAddr
 }
 
 func (s *Server) AdminAddress() string {

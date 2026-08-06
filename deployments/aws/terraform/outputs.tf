@@ -18,6 +18,11 @@ output "online_endpoint" {
   value       = "tls://${var.hostname}:29900"
 }
 
+output "public_web_url" {
+  description = "Public status, leaderboard, players, lobbies, and active-games web interface."
+  value       = "http://${var.hostname}:8082/"
+}
+
 output "instance_id" {
   description = "EC2 instance ID used for SSM operations."
   value       = aws_instance.server.id

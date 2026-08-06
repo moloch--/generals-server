@@ -3,6 +3,7 @@ package app
 import (
 	"errors"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -13,6 +14,7 @@ type Config struct {
 	HealthAddr                string
 	AdminAddr                 string
 	AdminTokenFile            string
+	PublicWebAddr             string
 	PublicHost                string
 	PublicRelayPort           int
 	DataFile                  string
@@ -57,6 +59,36 @@ func DefaultConfig() Config {
 		ControlReadTimeout:       90 * time.Second,
 		SessionTTL:               24 * time.Hour,
 	}
+}
+
+// GeneralsX @feature OpenAI 06/08/2026 Keep the public web listener off every private HTTP port.
+func validatePublicWebListenerPorts(cfg Config) error {
+	publicPort, enabled := configuredNonzeroTCPPort(cfg.PublicWebAddr)
+	if !enabled {
+		return nil
+	}
+	if adminPort, ok := configuredNonzeroTCPPort(cfg.AdminAddr); ok && adminPort == publicPort {
+		return errors.New("public web and admin listeners must use different nonzero TCP ports")
+	}
+	if healthPort, ok := configuredNonzeroTCPPort(cfg.HealthAddr); ok && healthPort == publicPort {
+		return errors.New("public web and health listeners must use different nonzero TCP ports")
+	}
+	return nil
+}
+
+func configuredNonzeroTCPPort(address string) (int, bool) {
+	if address == "" {
+		return 0, false
+	}
+	_, portText, err := net.SplitHostPort(address)
+	if err != nil {
+		return 0, false
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return 0, false
+	}
+	return port, true
 }
 
 func validatePublicHost(host string) error {

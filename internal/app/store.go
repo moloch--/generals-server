@@ -319,6 +319,42 @@ func (s *ProfileStore) profileCount(ctx context.Context) (uint64, error) {
 	return uint64(count), nil
 }
 
+// GeneralsX @feature OpenAI 06/08/2026 Query only the public ranking fields through a fixed-size leaderboard.
+func (s *ProfileStore) PublicLeaderboard(ctx context.Context) ([]publicLeaderboardRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT display_name, wins, losses, games, rating
+		FROM profiles
+		WHERE games > 0
+		ORDER BY rating DESC, wins DESC, losses ASC, games DESC, display_name_key ASC
+		LIMIT ?`, publicLeaderboardLimit)
+	if err != nil {
+		return nil, fmt.Errorf("query public leaderboard: %w", err)
+	}
+	records := make([]publicLeaderboardRecord, 0, publicLeaderboardLimit)
+	for rows.Next() {
+		var record publicLeaderboardRecord
+		if err := rows.Scan(
+			&record.DisplayName,
+			&record.Stats.Wins,
+			&record.Stats.Losses,
+			&record.Stats.Games,
+			&record.Stats.Rating,
+		); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan public leaderboard: %w", err)
+		}
+		records = append(records, record)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("iterate public leaderboard: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close public leaderboard query: %w", err)
+	}
+	return records, nil
+}
+
 func (s *ProfileStore) listAdminProfiles(ctx context.Context, search string, limit, offset int) ([]storedAdminProfile, uint64, error) {
 	if limit < 1 || limit > 100 {
 		return nil, 0, errors.New("profile page limit must be between 1 and 100")

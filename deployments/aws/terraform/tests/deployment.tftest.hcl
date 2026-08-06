@@ -218,9 +218,25 @@ run "cost_effective_single_host_topology" {
       length(aws_vpc_security_group_ingress_rule.relay) == 1 &&
       one(values(aws_vpc_security_group_ingress_rule.relay)).from_port == 27901 &&
       one(values(aws_vpc_security_group_ingress_rule.relay)).to_port == 27901 &&
-      one(values(aws_vpc_security_group_ingress_rule.relay)).ip_protocol == "udp"
+      one(values(aws_vpc_security_group_ingress_rule.relay)).ip_protocol == "udp" &&
+      length(aws_vpc_security_group_ingress_rule.public_web) == 1 &&
+      one(values(aws_vpc_security_group_ingress_rule.public_web)).from_port == 8082 &&
+      one(values(aws_vpc_security_group_ingress_rule.public_web)).to_port == 8082 &&
+      one(values(aws_vpc_security_group_ingress_rule.public_web)).ip_protocol == "tcp" &&
+      length(regexall("from_port\\s*=\\s*808[01]", file("${path.module}/network.tf"))) == 0 &&
+      length(regexall("to_port\\s*=\\s*808[01]", file("${path.module}/network.tf"))) == 0
     )
-    error_message = "Only the public Generals control and relay listeners should receive ingress rules."
+    error_message = "Only control, relay, and public web may receive ingress; health and admin must remain private."
+  }
+
+  assert {
+    condition = (
+      output.public_web_url == "http://online.example.com:8082/" &&
+      length(regexall("127\\.0\\.0\\.1:8080:8080/tcp", file("${path.module}/../runtime/compose.yaml"))) == 1 &&
+      length(regexall("127\\.0\\.0\\.1:8081:8081/tcp", file("${path.module}/../runtime/compose.yaml"))) == 1 &&
+      length(regexall("8082:8082/tcp", file("${path.module}/../runtime/compose.yaml"))) == 1
+    )
+    error_message = "Runtime Compose must publish only public web broadly while keeping health and admin on loopback."
   }
 
   assert {

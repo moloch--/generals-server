@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -8,6 +9,67 @@ import (
 	"path/filepath"
 	"testing"
 )
+
+func TestProfileStorePublicLeaderboardIsBoundedFilteredAndDeterministic(t *testing.T) {
+	store := openTestProfileStore(t, "")
+	ranked := []struct {
+		username string
+		display  string
+		stats    PlayerStats
+	}{
+		{username: "rank_alpha", display: "Alpha", stats: PlayerStats{Wins: 5, Losses: 2, Games: 10, Rating: 100}},
+		{username: "rank_beta", display: "Beta", stats: PlayerStats{Wins: 5, Losses: 1, Games: 9, Rating: 100}},
+		{username: "rank_gamma", display: "Gamma", stats: PlayerStats{Wins: 5, Losses: 1, Games: 12, Rating: 100}},
+		{username: "rank_delta", display: "Delta", stats: PlayerStats{Wins: 6, Losses: 4, Games: 12, Rating: 100}},
+		{username: "rank_echo", display: "Echo", stats: PlayerStats{Wins: 1, Games: 1, Rating: 101}},
+	}
+	for _, entry := range ranked {
+		profile, err := store.Register(entry.username, "valid password", entry.display)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.ApplyStats(profile.UserID, entry.stats); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for index := range 25 {
+		profile, err := store.Register(
+			fmt.Sprintf("filler_%02d", index),
+			"valid password",
+			fmt.Sprintf("Filler %02d", index),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.ApplyStats(profile.UserID, PlayerStats{Wins: 1, Games: 1, Rating: int64(50 - index)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.Register("never_played", "valid password", "Never Played"); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := store.PublicLeaderboard(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != publicLeaderboardLimit {
+		t.Fatalf("leaderboard length=%d, want %d", len(entries), publicLeaderboardLimit)
+	}
+	for index, want := range []string{"Echo", "Delta", "Gamma", "Beta", "Alpha"} {
+		if entries[index].DisplayName != want {
+			t.Errorf("leaderboard[%d]=%q, want %q", index, entries[index].DisplayName, want)
+		}
+	}
+	for _, entry := range entries {
+		if entry.DisplayName == "Never Played" || entry.Stats.Games == 0 {
+			t.Fatalf("leaderboard included an unplayed profile: %+v", entry)
+		}
+		if entry.Stats.Disconnects != 0 {
+			t.Fatalf("public leaderboard record unexpectedly populated disconnects: %+v", entry)
+		}
+	}
+}
 
 func TestProfileStoreProfileLimitIsAtomic(t *testing.T) {
 	t.Parallel()

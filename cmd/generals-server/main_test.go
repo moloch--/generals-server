@@ -32,6 +32,7 @@ var existingServerFlagNames = []string{
 	"max-staged-games",
 	"public-host",
 	"public-relay-port",
+	"public-web-listen",
 	"relay-bytes-per-second",
 	"relay-listen",
 	"relay-packets-per-second",
@@ -41,13 +42,14 @@ var existingServerFlagNames = []string{
 }
 
 type fakeOnlineServer struct {
-	start       func(context.Context) error
-	shutdown    func(context.Context) error
-	controlAddr string
-	relayAddr   string
-	healthAddr  string
-	adminAddr   string
-	errors      <-chan error
+	start         func(context.Context) error
+	shutdown      func(context.Context) error
+	controlAddr   string
+	relayAddr     string
+	healthAddr    string
+	adminAddr     string
+	publicWebAddr string
+	errors        <-chan error
 }
 
 func (server *fakeOnlineServer) Start(ctx context.Context) error {
@@ -64,11 +66,12 @@ func (server *fakeOnlineServer) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-func (server *fakeOnlineServer) ControlAddress() string { return server.controlAddr }
-func (server *fakeOnlineServer) RelayAddress() string   { return server.relayAddr }
-func (server *fakeOnlineServer) HealthAddress() string  { return server.healthAddr }
-func (server *fakeOnlineServer) AdminAddress() string   { return server.adminAddr }
-func (server *fakeOnlineServer) Errors() <-chan error   { return server.errors }
+func (server *fakeOnlineServer) ControlAddress() string   { return server.controlAddr }
+func (server *fakeOnlineServer) RelayAddress() string     { return server.relayAddr }
+func (server *fakeOnlineServer) HealthAddress() string    { return server.healthAddr }
+func (server *fakeOnlineServer) AdminAddress() string     { return server.adminAddr }
+func (server *fakeOnlineServer) PublicWebAddress() string { return server.publicWebAddr }
+func (server *fakeOnlineServer) Errors() <-chan error     { return server.errors }
 
 func TestRootCommandRegistersExistingFlags(t *testing.T) {
 	runner := &commandRunner{stdout: io.Discard, stderr: io.Discard}
@@ -113,6 +116,7 @@ func TestRootCommandBindsAllFlags(t *testing.T) {
 		"--health-listen=127.0.0.1:31002",
 		"--admin-listen=127.0.0.1:31003",
 		"--admin-token-file=/run/secrets/admin-token",
+		"--public-web-listen=127.0.0.1:31004",
 		"--public-host", "relay.example.net",
 		"--public-relay-port", "32001",
 		"--data-file=/var/lib/generals/profiles.db",
@@ -142,6 +146,7 @@ func TestRootCommandBindsAllFlags(t *testing.T) {
 	want.HealthAddr = "127.0.0.1:31002"
 	want.AdminAddr = "127.0.0.1:31003"
 	want.AdminTokenFile = "/run/secrets/admin-token"
+	want.PublicWebAddr = "127.0.0.1:31004"
 	want.PublicHost = "relay.example.net"
 	want.PublicRelayPort = 32001
 	want.DataFile = "/var/lib/generals/profiles.db"
@@ -281,17 +286,21 @@ func TestServerLifecycleUsesIndependentShutdownContext(t *testing.T) {
 			shutdown <- shutdownState{err: shutdownCtx.Err(), remaining: time.Until(deadline), deadline: ok}
 			return nil
 		},
-		controlAddr: "127.0.0.1:29900",
-		relayAddr:   "127.0.0.1:27901",
-		healthAddr:  "127.0.0.1:8080",
-		adminAddr:   "",
+		controlAddr:   "127.0.0.1:29900",
+		relayAddr:     "127.0.0.1:27901",
+		healthAddr:    "127.0.0.1:8080",
+		adminAddr:     "",
+		publicWebAddr: "127.0.0.1:8082",
 	}
 	factory := func(app.Config, *slog.Logger) (onlineServer, error) { return server, nil }
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	result := make(chan int, 1)
 	go func() {
-		result <- execute(ctx, []string{"--public-host=relay.example.net"}, &stdout, &stderr, factory)
+		result <- execute(ctx, []string{
+			"--public-host=relay.example.net",
+			"--public-web-listen=127.0.0.1:8082",
+		}, &stdout, &stderr, factory)
 	}()
 
 	var startCtx context.Context
@@ -333,6 +342,7 @@ func TestServerLifecycleUsesIndependentShutdownContext(t *testing.T) {
 		"relay=127.0.0.1:27901",
 		"health=127.0.0.1:8080",
 		"admin=\"\"",
+		"public_web=127.0.0.1:8082",
 		"public_host=relay.example.net",
 	} {
 		if !strings.Contains(stdout.String(), text) {

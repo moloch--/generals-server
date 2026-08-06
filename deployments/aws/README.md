@@ -7,9 +7,9 @@ CloudWatch Logs.
 
 It intentionally creates no load balancer, NAT Gateway, Auto Scaling group,
 backup policy, snapshot schedule, SSH listener, bastion, or multi-AZ replica.
-TCP `29900` and UDP `27901` are the only public inbound ports. Health TCP `8080`
-and admin TCP `8081` bind to host loopback and are reachable through Session
-Manager port forwarding.
+TCP `29900`, UDP `27901`, and the read-only website on TCP `8082` are public
+inbound ports. Health TCP `8080` and admin TCP `8081` bind to host loopback and
+are reachable through Session Manager port forwarding.
 
 ## Availability and data boundary
 
@@ -125,6 +125,8 @@ Set at least:
 - public hostname and hosted-zone ID;
 - ACME contact email;
 - ECR repository name and published image digest.
+- optional gameplay and public-web IPv4 CIDR allowlists; both default to the
+  public Internet.
 
 Initialize the backend using the bucket created above:
 
@@ -183,6 +185,23 @@ openssl s_client \
 
 An arbitrary UDP probe cannot validate the authenticated relay. Use the
 repository's real client/integration flow for UDP verification.
+
+Verify the independently routed public website and snapshot API:
+
+```bash
+public_web_url=$(terraform output -raw public_web_url)
+curl --fail --show-error --silent "$public_web_url" >/dev/null
+curl --fail --show-error --silent "${public_web_url}api/public/v1/snapshot"
+```
+
+The supplied single-host stack exposes TCP `8082` as plaintext origin HTTP. For
+a browser-facing production site, terminate HTTPS separately on TCP `443` and
+forward only public-site requests to this origin; the stack intentionally does
+not claim built-in web TLS or send private admin TCP `8081` through that path.
+
+TCP `8082` exposes only read-only public data. The private admin UI and every
+`/api/admin/v1/*` route remain unavailable there even if a request supplies an
+admin bearer token.
 
 ## Admin access
 

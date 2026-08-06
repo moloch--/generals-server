@@ -2,12 +2,12 @@
 set -euo pipefail
 
 for _ in $(seq 1 30); do
-  if curl --fail --silent --show-error --max-time 2 http://127.0.0.1:8080/readyz >/dev/null; then
+  if curl --fail --silent --show-error --max-time 2 http://127.0.0.1:8080/readyz >/dev/null &&
+    curl --fail --silent --show-error --max-time 2 http://127.0.0.1:8082/api/public/v1/snapshot >/dev/null; then
     exit 0
   fi
   sleep 1
 done
 
-echo "generals-server did not become ready within 30 seconds" >&2
+echo "generals-server health or public web listener did not become ready within 30 seconds" >&2
 exit 1
-

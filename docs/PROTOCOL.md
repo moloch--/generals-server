@@ -11,6 +11,7 @@ Default ports:
 | Control | TCP or TLS-over-TCP | `29900` |
 | Gameplay relay | UDP | `27901` |
 | Health and metrics | HTTP | `8080` |
+| Public website and snapshot | HTTP | `8082` (opt-in) |
 
 The game command-line flag `-onlineServer <endpoint>` selects the control
 endpoint. `tls://host[:control-port]` requires verified TLS and enables
@@ -536,7 +537,9 @@ The token authenticates routing but does not encrypt gameplay. Internet
 deployments should firewall UDP to the relay port, monitor `/metrics`, and use
 short idle timeouts appropriate to their player population.
 
-## HTTP operations endpoints
+## HTTP auxiliary endpoints
+
+The private operations listener exposes:
 
 - `GET /healthz` and `GET /readyz` return JSON with control/relay addresses,
   player/game counts, and relay counters.
@@ -545,3 +548,15 @@ short idle timeouts appropriate to their player population.
 The default HTTP listener is `:8080`; it is not part of the game client
 protocol and should be firewalled from the public Internet or explicitly bound
 to a private monitoring interface.
+
+The separately configured public listener exposes the website at `/` and one
+read-only endpoint, `GET /api/public/v1/snapshot`. It is disabled until
+`--public-web-listen` is set; the supplied deployments bind it to TCP `8082`.
+The public snapshot describes service status, leaderboard entries, online
+players, joinable lobbies, and active games using bounded public display data.
+TCP `8082` is plaintext origin HTTP; Internet deployments should terminate
+HTTPS on a public reverse proxy before forwarding requests to this listener.
+
+Admin routes are not part of this listener. `/admin/` and
+`/api/admin/v1/*` are served only by the independently configured private admin
+server on TCP `8081` in the supplied deployments.

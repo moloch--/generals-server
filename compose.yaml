@@ -17,10 +17,12 @@ services:
       - --tls-key=/tls/privkey.pem
       - --admin-listen=:8081
       - --admin-token-file=/run/secrets/admin-token
+      - --public-web-listen=:8082
     ports:
       - "29900:29900/tcp"
       - "27901:27901/udp"
       - "127.0.0.1:8080:8080/tcp"
+      - "8082:8082/tcp"
       - target: 8081
         published: "8081"
         protocol: tcp

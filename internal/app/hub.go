@@ -457,6 +457,111 @@ func (h *Hub) Stats() HubStats {
 	return stats
 }
 
+// GeneralsX @feature OpenAI 06/08/2026 Copy a deliberately redacted snapshot for the public web listener.
+func (h *Hub) PublicActivitySnapshot() publicActivitySnapshot {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	snapshot := publicActivitySnapshot{
+		Overview: publicOverview{
+			OnlinePlayers: len(h.clients),
+			QueuedPlayers: len(h.matchQueue),
+		},
+		OnlinePlayers: make([]publicOnlinePlayer, 0, len(h.clients)),
+		Lobbies:       make([]publicLobby, 0, len(h.games)),
+		ActiveGames:   make([]publicActiveGame, 0, len(h.games)),
+	}
+	for userID, client := range h.clients {
+		status := "online"
+		if game := h.games[h.userGame[userID]]; game != nil {
+			if game.state == "open" {
+				status = "in_lobby"
+			} else if game.state == "starting" || game.state == "started" {
+				status = "in_game"
+			}
+		} else if _, queued := h.matchQueue[userID]; queued {
+			status = "quick_match"
+		} else if client.status == "away" {
+			status = "away"
+		}
+		snapshot.OnlinePlayers = append(snapshot.OnlinePlayers, publicOnlinePlayer{
+			DisplayName: client.profile.DisplayName,
+			Status:      status,
+		})
+	}
+	sort.Slice(snapshot.OnlinePlayers, func(i, j int) bool {
+		first := strings.ToLower(snapshot.OnlinePlayers[i].DisplayName)
+		second := strings.ToLower(snapshot.OnlinePlayers[j].DisplayName)
+		if first != second {
+			return first < second
+		}
+		return snapshot.OnlinePlayers[i].DisplayName < snapshot.OnlinePlayers[j].DisplayName
+	})
+
+	for _, game := range h.games {
+		if game.listed && game.state == "open" {
+			hostName := ""
+			if host := game.members[game.hostID]; host != nil && host.client != nil {
+				hostName = host.client.profile.DisplayName
+			}
+			snapshot.Lobbies = append(snapshot.Lobbies, publicLobby{
+				Name:        game.name,
+				Map:         game.options.Map,
+				HostName:    hostName,
+				Players:     len(game.members),
+				MaxPlayers:  game.maxPlayers,
+				HasPassword: game.password != "",
+				Product:     game.compatibility.Product,
+			})
+			continue
+		}
+		if game.state != "starting" && game.state != "started" {
+			continue
+		}
+		name := game.name
+		mapName := game.options.Map
+		if !game.listed {
+			name = "Quick Match"
+			mapName = ""
+		}
+		snapshot.ActiveGames = append(snapshot.ActiveGames, publicActiveGame{
+			Name:       name,
+			Map:        mapName,
+			Players:    len(game.members),
+			MaxPlayers: game.maxPlayers,
+			Product:    game.compatibility.Product,
+			State:      game.state,
+		})
+	}
+	sort.Slice(snapshot.Lobbies, func(i, j int) bool {
+		firstName := strings.ToLower(snapshot.Lobbies[i].Name)
+		secondName := strings.ToLower(snapshot.Lobbies[j].Name)
+		if firstName != secondName {
+			return firstName < secondName
+		}
+		firstHost := strings.ToLower(snapshot.Lobbies[i].HostName)
+		secondHost := strings.ToLower(snapshot.Lobbies[j].HostName)
+		if firstHost != secondHost {
+			return firstHost < secondHost
+		}
+		return snapshot.Lobbies[i].Product < snapshot.Lobbies[j].Product
+	})
+	sort.Slice(snapshot.ActiveGames, func(i, j int) bool {
+		firstName := strings.ToLower(snapshot.ActiveGames[i].Name)
+		secondName := strings.ToLower(snapshot.ActiveGames[j].Name)
+		if firstName != secondName {
+			return firstName < secondName
+		}
+		if snapshot.ActiveGames[i].Product != snapshot.ActiveGames[j].Product {
+			return snapshot.ActiveGames[i].Product < snapshot.ActiveGames[j].Product
+		}
+		return snapshot.ActiveGames[i].State < snapshot.ActiveGames[j].State
+	})
+	snapshot.Overview.OpenLobbies = len(snapshot.Lobbies)
+	snapshot.Overview.ActiveGames = len(snapshot.ActiveGames)
+	return snapshot
+}
+
 func (h *Hub) AdminSnapshot() adminHubSnapshot {
 	h.mu.RLock()
 	defer h.mu.RUnlock()

@@ -1,10 +1,10 @@
-aws_region                 = "us-west-2"
-availability_zone          = "us-west-2a"
-expected_aws_account_id    = "123456789012"
-hostname                   = "online.example.net"
-route53_zone_id            = "Z0123456789EXAMPLE"
-acme_email                 = "operator@example.net"
-ecr_repository_name        = "generals-server"
-container_image_digest     = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-allowed_gameplay_ipv4_cidrs = ["0.0.0.0/0"]
-
+aws_region                      = "us-west-2"
+availability_zone               = "us-west-2a"
+expected_aws_account_id         = "123456789012"
+hostname                        = "online.example.net"
+route53_zone_id                 = "Z0123456789EXAMPLE"
+acme_email                      = "operator@example.net"
+ecr_repository_name             = "generals-server"
+container_image_digest          = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+allowed_gameplay_ipv4_cidrs     = ["0.0.0.0/0"]
+allowed_public_web_ipv4_cidrs = ["0.0.0.0/0"]

@@ -12,6 +12,11 @@ can front the control listener, but it cannot replace the UDP port; preserve the
 original long-lived TCP connection and route UDP directly to the same server
 process.
 
+TCP 8082 exposes the read-only public website and its snapshot API. Publish it
+only when the public site is wanted by passing `--public-web-listen=:8082`;
+the listener is disabled by default. TCP 8082 is a separate HTTP server from
+both operations and administration.
+
 The optional admin listener exposes an embedded web dashboard and REST API.
 Keep it on a private management interface. The Compose deployment publishes
 TCP 8081 only on `GENERALS_ADMIN_HOST`, which should be the exact IPv4 address
@@ -161,8 +166,9 @@ docker compose restart
 docker compose down
 ```
 
-The compose definition publishes operations HTTP on host loopback only and the
-admin service on the exact Tailscale IPv4 address only. It drops Linux
+The compose definition publishes the read-only website on TCP `8082`,
+operations HTTP on host loopback only, and the admin service on the exact
+Tailscale IPv4 address only. It drops Linux
 capabilities, uses a read-only container filesystem, and bind-mounts
 `GENERALS_DATA_DIR` at `/data`. It runs as `GENERALS_UID:GENERALS_GID`, so
 `profiles.db` and any WAL sidecars remain owned and directly accessible by the
@@ -176,6 +182,30 @@ host database directory. Stop the service before making a file-level backup,
 then copy the complete `GENERALS_DATA_DIR`; do not omit WAL or shared-memory
 sidecars. Keep backups outside that directory and test restoration with an
 isolated server process.
+
+## Public website and snapshot API
+
+Start the public listener explicitly:
+
+```bash
+generals-server --public-web-listen :8082
+```
+
+The website is available at `/`. Its sole JSON endpoint is
+`GET /api/public/v1/snapshot`, which returns bounded, read-only data for service
+status, the leaderboard, online players, joinable lobbies, and active games.
+The response is intentionally limited to public display data: it does not
+include account usernames, credentials, admin bearer material, relay secrets,
+or mutation controls.
+
+The public and admin servers do not share a route table. Requests for
+`/admin/` or `/api/admin/v1/*` on TCP `8082` return not found, including requests
+that send an otherwise valid admin bearer token. The public API accepts no
+cross-origin requests and provides no state-changing method.
+
+Public TCP `8082` is plain HTTP in the supplied direct-listener deployment. If
+transport encryption for the website is required, place an HTTPS reverse proxy
+in front of TCP `8082`; keep the admin listener on its separate private binding.
 
 ## Admin dashboard and REST API
 
@@ -249,13 +279,16 @@ sudo systemctl enable --now generals-server
 
 Create the locked-down `generals-server` system user and install readable TLS
 files before starting the unit. The service uses systemd's `StateDirectory` for
-the SQLite database and its WAL sidecars, and binds health checks to loopback.
+the SQLite database and its WAL sidecars, binds health checks to loopback, and
+enables only the read-only public website on TCP `8082`. Admin remains disabled
+until both private admin flags are added deliberately.
 
 ## Monitoring
 
 Use `GET /healthz` or `GET /readyz` for process health. Both return live control
 and relay addresses, player/game gauges, and UDP counters. `GET /metrics`
-returns Prometheus text.
+returns Prometheus text. Query `GET /api/public/v1/snapshot` through TCP `8082`
+to verify the independently routed public service.
 
 Important signals:
 
@@ -274,7 +307,8 @@ container runtime or journal.
 
 ## Graceful updates
 
-Send SIGTERM and allow up to ten seconds for control and HTTP shutdown. Active
+Send SIGTERM and allow up to ten seconds for control and all HTTP listeners to
+shut down. Active
 matches are not migrated; a restart invalidates in-memory sessions, rooms,
 games, quickmatch entries, guest profiles, and relay tokens. Persistent account
 data remains.

@@ -46,6 +46,42 @@ jobs:
       - name: Build container
         run: docker build --tag generals-server:test .
 
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24.x"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci --prefix web
+
+      - name: Type-check frontend source
+        run: npm run --prefix web typecheck
+
+      - name: Build embedded public application
+        run: npm run --prefix web build:public
+
+      - name: Verify embedded assets are current
+        run: git diff --exit-code -- internal/app/publicui/dist
+
+      - name: Verify public assets contain no admin client
+        run: |
+          test -s internal/app/publicui/dist/index.html
+          if grep --recursive --line-number --extended-regexp \
+            '/api/admin/v1/|generals-server-admin-token|generals-admin' \
+            internal/app/publicui/dist; then
+            echo "public assets contain an admin API or credential marker" >&2
+            exit 1
+          fi
+
   infrastructure:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -94,3 +130,20 @@ jobs:
           GENERALS_PLATFORM: linux/arm64
           GENERALS_PUBLIC_HOST: online.example.net
         run: docker compose -f deployments/aws/runtime/compose.yaml config --quiet
+
+      - name: Render standard Compose definition
+        env:
+          GENERALS_ADMIN_HOST: 100.64.0.1
+          GENERALS_ADMIN_TOKEN_FILE: /tmp/generals-admin-token
+          GENERALS_DATA_DIR: /tmp/generals-data
+          GENERALS_GID: "1000"
+          GENERALS_PUBLIC_HOST: online.example.net
+          GENERALS_TLS_DIR: /tmp/generals-tls
+          GENERALS_UID: "1000"
+        run: |
+          docker compose config --format json | jq --exit-status '
+            .services["generals-server"].ports as $ports |
+            any($ports[]; .target == 8082 and (has("host_ip") | not)) and
+            any($ports[]; .target == 8080 and .host_ip == "127.0.0.1") and
+            any($ports[]; .target == 8081 and .host_ip == env.GENERALS_ADMIN_HOST)
+          '
