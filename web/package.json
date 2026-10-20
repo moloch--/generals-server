@@ -57,7 +57,7 @@
     "@vitejs/plugin-react": "6.0.5",
     "tailwindcss": "4.3.3",
     "typescript": "7.0.2",
-    "vite": "8.2.0"
+    "vite": "8.3.4"
   },
   "overrides": {
     "tar": "7.5.22"
